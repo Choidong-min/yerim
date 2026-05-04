@@ -105,7 +105,14 @@ async function kakaoDistance(
 }
 
 export async function POST(req: NextRequest) {
-  const key = "7356a5f00174055d71b1c398a9eec8d8";
+  const key = process.env.KAKAO_REST_API_KEY;
+
+  if (!key) {
+    return NextResponse.json(
+      { error: "KAKAO_REST_API_KEY 없음" },
+      { status: 500 }
+    );
+  }
 
   try {
     const body = await req.json();
@@ -114,7 +121,10 @@ export async function POST(req: NextRequest) {
     const destinations = body.destinations as Coord[] | undefined;
 
     if (!origin) {
-      return NextResponse.json({ error: "출발 좌표 없음" }, { status: 400 });
+      return NextResponse.json(
+        { error: "출발 좌표 없음" },
+        { status: 400 }
+      );
     }
 
     if (Array.isArray(destinations)) {
@@ -131,7 +141,10 @@ export async function POST(req: NextRequest) {
     }
 
     if (!destination) {
-      return NextResponse.json({ error: "도착 좌표 없음" }, { status: 400 });
+      return NextResponse.json(
+        { error: "도착 좌표 없음" },
+        { status: 400 }
+      );
     }
 
     const result = await kakaoDistance(key, origin, destination);
