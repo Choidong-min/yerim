@@ -1,95 +1,145 @@
 import { NextRequest, NextResponse } from "next/server";
 
+export const dynamic = "force-dynamic";
+
 type Coord = {
-  lat: number;
-  lng: number;
+  x: string | number;
+  y: string | number;
 };
 
-// 직선거리 → 도로거리 보정
-function fallbackDistance(origin: Coord, destination: Coord) {
+function toNumber(value: string | number) {
+  return typeof value === "number" ? value : Number(value);
+}
+
+function haversineKm(origin: Coord, destination: Coord) {
+  const lon1 = toNumber(origin.x);
+  const lat1 = toNumber(origin.y);
+  const lon2 = toNumber(destination.x);
+  const lat2 = toNumber(destination.y);
+
   const R = 6371;
-  const dLat = ((destination.lat - origin.lat) * Math.PI) / 180;
-  const dLng = ((destination.lng - origin.lng) * Math.PI) / 180;
+  const dLat = ((lat2 - lat1) * Math.PI) / 180;
+  const dLon = ((lon2 - lon1) * Math.PI) / 180;
+  const rLat1 = (lat1 * Math.PI) / 180;
+  const rLat2 = (lat2 * Math.PI) / 180;
 
-  const a =
-    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
-    Math.cos((origin.lat * Math.PI) / 180) *
-      Math.cos((destination.lat * Math.PI) / 180) *
-      Math.sin(dLng / 2) *
-      Math.sin(dLng / 2);
+  const h =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos(rLat1) * Math.cos(rLat2) * Math.sin(dLon / 2) ** 2;
 
-  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-  const straightKm = R * c;
-
-  const roadLikeKm = Math.round(straightKm * 1.35 * 10) / 10;
-
-  return {
-    distanceKm: roadLikeKm,
-    durationMin: Math.max(1, Math.round(roadLikeKm * 1.6)),
-    fallback: true,
-  };
+  return 2 * R * Math.asin(Math.sqrt(h));
 }
 
 async function kakaoDistance(
+  key: string,
   origin: Coord,
-  destination: Coord,
-  key: string
-) {
-  const url = `https://apis-navi.kakaomobility.com/v1/directions?origin=${origin.lng},${origin.lat}&destination=${destination.lng},${destination.lat}`;
+  destination: Coord
+): Promise<{ distanceKm: number; durationMin: number; fallback: boolean }> {
+  const originX = toNumber(origin.x);
+  const originY = toNumber(origin.y);
+  const destinationX = toNumber(destination.x);
+  const destinationY = toNumber(destination.y);
 
-  const res = await fetch(url, {
-    headers: {
-      Authorization: `KakaoAK ${key}`,
-    },
-  });
-
-  if (!res.ok) {
-    throw new Error("카카오 API 실패");
+  if (
+    Number.isNaN(originX) ||
+    Number.isNaN(originY) ||
+    Number.isNaN(destinationX) ||
+    Number.isNaN(destinationY)
+  ) {
+    throw new Error("좌표값 오류");
   }
 
-  const data = await res.json();
+  const url = new URL("https://apis-navi.kakaomobility.com/v1/directions");
+  url.searchParams.set("origin", `${originX},${originY}`);
+  url.searchParams.set("destination", `${destinationX},${destinationY}`);
+  url.searchParams.set("priority", "TIME");
+  url.searchParams.set("car_fuel", "GASOLINE");
+  url.searchParams.set("car_hipass", "false");
+  url.searchParams.set("alternatives", "false");
+  url.searchParams.set("road_details", "false");
+  url.searchParams.set("summary", "true");
 
-  const route = data.routes?.[0]?.summary;
+  try {
+    const res = await fetch(url.toString(), {
+      headers: {
+        Authorization: `KakaoAK ${key}`,
+        "Content-Type": "application/json",
+      },
+      cache: "no-store",
+    });
 
-  if (!route) {
-    throw new Error("경로 없음");
+    const text = await res.text();
+
+    let data: any = null;
+    try {
+      data = JSON.parse(text);
+    } catch {
+      data = { raw: text };
+    }
+
+    if (!res.ok) {
+      throw new Error(data?.message || data?.error || "카카오 길찾기 실패");
+    }
+
+    const summary = data?.routes?.[0]?.summary;
+
+    if (!summary) {
+      throw new Error("경로 없음");
+    }
+
+    return {
+      distanceKm: Math.round((Number(summary.distance) / 1000) * 10) / 10,
+      durationMin: Math.round(Number(summary.duration) / 60),
+      fallback: false,
+    };
+  } catch {
+    const straightKm = haversineKm(origin, destination);
+    const roadLikeKm = Math.round(straightKm * 1.35 * 10) / 10;
+
+    return {
+      distanceKm: roadLikeKm,
+      durationMin: Math.max(1, Math.round(roadLikeKm * 1.6)),
+      fallback: true,
+    };
   }
-
-  return {
-    distanceKm: Math.round(route.distance / 100) / 10,
-    durationMin: Math.round(route.duration / 60),
-    fallback: false,
-  };
 }
 
 export async function POST(req: NextRequest) {
-  // 👉 여기에 키 넣어라
   const key = "7356a5f00174055d71b1c398a9eec8d8";
 
   try {
     const body = await req.json();
+    const origin = body.origin as Coord | undefined;
+    const destination = body.destination as Coord | undefined;
+    const destinations = body.destinations as Coord[] | undefined;
 
-    const origin: Coord = body.origin;
-    const destination: Coord = body.destination;
-
-    if (!origin || !destination) {
-      return NextResponse.json(
-        { error: "좌표 없음" },
-        { status: 400 }
-      );
+    if (!origin) {
+      return NextResponse.json({ error: "출발 좌표 없음" }, { status: 400 });
     }
 
-    try {
-      const result = await kakaoDistance(origin, destination, key);
-      return NextResponse.json(result);
-    } catch {
-      // 카카오 실패 → fallback
-      const fallback = fallbackDistance(origin, destination);
-      return NextResponse.json(fallback);
+    if (Array.isArray(destinations)) {
+      let current = origin;
+      const sections = [];
+
+      for (const dest of destinations) {
+        const section = await kakaoDistance(key, current, dest);
+        sections.push(section);
+        current = dest;
+      }
+
+      return NextResponse.json({ sections });
     }
-  } catch {
+
+    if (!destination) {
+      return NextResponse.json({ error: "도착 좌표 없음" }, { status: 400 });
+    }
+
+    const result = await kakaoDistance(key, origin, destination);
+
+    return NextResponse.json(result);
+  } catch (error: any) {
     return NextResponse.json(
-      { error: "서버 오류" },
+      { error: error?.message || "거리 계산 API 호출 실패" },
       { status: 500 }
     );
   }
