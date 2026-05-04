@@ -42,14 +42,8 @@ async function kakaoSearch(url: string, key: string) {
 }
 
 export async function POST(req: NextRequest) {
-  const key = process.env.KAKAO_REST_API_KEY;
-
-  if (!key) {
-    return NextResponse.json(
-      { error: "KAKAO_REST_API_KEY 없음" },
-      { status: 500 }
-    );
-  }
+  // 🔥 여기 수정 (환경변수 → 직접 입력)
+  const key = "7356a5f00174055d71b1c398a9eec8d8";
 
   try {
     const body = await req.json();

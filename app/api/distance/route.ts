@@ -107,12 +107,10 @@ async function kakaoDistance(
 export async function POST(req: NextRequest) {
   const key = process.env.KAKAO_REST_API_KEY;
 
-  if (!key) {
-    return NextResponse.json(
-      { error: "KAKAO_REST_API_KEY 없음" },
-      { status: 500 }
-    );
-  }
+export async function POST(req: NextRequest) {
+  const key = "7356a5f00174055d71b1c398a9eec8d8";
+
+  try {
 
   try {
     const body = await req.json();
