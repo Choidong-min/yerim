@@ -53,11 +53,6 @@ async function kakaoDistance(
   url.searchParams.set("origin", `${originX},${originY}`);
   url.searchParams.set("destination", `${destinationX},${destinationY}`);
   url.searchParams.set("priority", "TIME");
-  url.searchParams.set("car_fuel", "GASOLINE");
-  url.searchParams.set("car_hipass", "false");
-  url.searchParams.set("alternatives", "false");
-  url.searchParams.set("road_details", "false");
-  url.searchParams.set("summary", "true");
 
   try {
     const res = await fetch(url.toString(), {
@@ -68,18 +63,7 @@ async function kakaoDistance(
       cache: "no-store",
     });
 
-    const text = await res.text();
-
-    let data: any = null;
-    try {
-      data = JSON.parse(text);
-    } catch {
-      data = { raw: text };
-    }
-
-    if (!res.ok) {
-      throw new Error(data?.message || data?.error || "카카오 길찾기 실패");
-    }
+    const data = await res.json();
 
     const summary = data?.routes?.[0]?.summary;
 
@@ -88,8 +72,8 @@ async function kakaoDistance(
     }
 
     return {
-      distanceKm: Math.round((Number(summary.distance) / 1000) * 10) / 10,
-      durationMin: Math.round(Number(summary.duration) / 60),
+      distanceKm: Math.round((summary.distance / 1000) * 10) / 10,
+      durationMin: Math.round(summary.duration / 60),
       fallback: false,
     };
   } catch {
@@ -107,53 +91,15 @@ async function kakaoDistance(
 export async function POST(req: NextRequest) {
   const key = process.env.KAKAO_REST_API_KEY;
 
-  if (!key) {
-    return NextResponse.json(
-      { error: "KAKAO_REST_API_KEY 없음" },
-      { status: 500 }
-    );
-  }
-
   try {
     const body = await req.json();
-    const origin = body.origin as Coord | undefined;
-    const destination = body.destination as Coord | undefined;
-    const destinations = body.destinations as Coord[] | undefined;
-
-    if (!origin) {
-      return NextResponse.json(
-        { error: "출발 좌표 없음" },
-        { status: 400 }
-      );
-    }
-
-    if (Array.isArray(destinations)) {
-      let current = origin;
-      const sections = [];
-
-      for (const dest of destinations) {
-        const section = await kakaoDistance(key, current, dest);
-        sections.push(section);
-        current = dest;
-      }
-
-      return NextResponse.json({ sections });
-    }
-
-    if (!destination) {
-      return NextResponse.json(
-        { error: "도착 좌표 없음" },
-        { status: 400 }
-      );
-    }
+    const origin = body.origin;
+    const destination = body.destination;
 
     const result = await kakaoDistance(key, origin, destination);
 
     return NextResponse.json(result);
-  } catch (error: any) {
-    return NextResponse.json(
-      { error: error?.message || "거리 계산 API 호출 실패" },
-      { status: 500 }
-    );
+  } catch (error) {
+    return NextResponse.json({ error: "거리 계산 실패" }, { status: 500 });
   }
 }
