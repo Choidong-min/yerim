@@ -445,9 +445,131 @@ export default function Home() {
     }));
   };
 
+  const getRouteAreaKey = (customer: Customer) => {
+    const raw = `${customer.area} ${customer.address}`;
+
+    if (raw.includes("목포")) return "목포";
+    if (raw.includes("나주")) return "나주";
+    if (raw.includes("무안")) return "무안";
+    if (raw.includes("해남")) return "해남";
+    if (raw.includes("진도")) return "진도";
+    if (raw.includes("영광")) return "영광";
+    if (raw.includes("광주")) return "광주";
+    if (raw.includes("순천")) return "순천";
+
+    return customer.area.replace("전남 ", "");
+  };
+
+  const getGradeRoutePenalty = (customer: Customer, step: number, total: number) => {
+    const earlyRatio = total <= 1 ? 0 : 1 - step / (total - 1);
+
+    // white는 화면상 검정/블랙 등급 역할. 초반 선호.
+    if (customer.grade === "white") return -22 * earlyRatio;
+    if (customer.grade === "blue") return -14 * earlyRatio;
+    if (customer.grade === "green") return 0;
+    if (customer.grade === "amber") return 10 * earlyRatio;
+    if (customer.grade === "yellow") return 26 * earlyRatio;
+    if (customer.grade === "red") return 75 * earlyRatio;
+
+    return 0;
+  };
+
+  const getFlagRoutePenalty = (customer: Customer, step: number, total: number) => {
+    const earlyRatio = total <= 1 ? 0 : 1 - step / (total - 1);
+
+    if (customer.productionDoor && !customer.forklift) return -180 * earlyRatio;
+    if (customer.urgent && !customer.forklift) return -120 * earlyRatio;
+    if (customer.forklift) return 140 * earlyRatio;
+
+    return 0;
+  };
+
+  const optimizeRouteWithRouteCost = async <T extends Customer & { coord: Coord }>(
+    startCoord: Coord,
+    targets: T[]
+  ) => {
+    type RouteState = {
+      route: T[];
+      remaining: T[];
+      currentCoord: Coord;
+      currentArea: string;
+      visitedAreas: Set<string>;
+      areaExitCount: Record<string, number>;
+      cost: number;
+    };
+
+    const beamWidth = targets.length <= 7 ? 90 : targets.length <= 10 ? 120 : 150;
+    const startArea = "출발지";
+
+    let states: RouteState[] = [
+      {
+        route: [],
+        remaining: targets,
+        currentCoord: startCoord,
+        currentArea: startArea,
+        visitedAreas: new Set([startArea]),
+        areaExitCount: {},
+        cost: 0,
+      },
+    ];
+
+    for (let step = 0; step < targets.length; step++) {
+      const nextStates: RouteState[] = [];
+
+      for (const state of states) {
+        for (const candidate of state.remaining) {
+          const result = await getDistance(state.currentCoord, candidate.coord);
+          const candidateArea = getRouteAreaKey(candidate);
+          const changedArea = state.currentArea !== candidateArea;
+          const returnedArea =
+            changedArea && state.visitedAreas.has(candidateArea) && candidateArea !== startArea;
+
+          const exitedCount = state.areaExitCount[candidateArea] ?? 0;
+          const repeatAreaPenalty = returnedArea ? 130 + exitedCount * 60 : 0;
+          const areaSwitchPenalty = changedArea && state.route.length > 0 ? 8 : 0;
+          const gradePenalty = getGradeRoutePenalty(candidate, step, targets.length);
+          const flagPenalty = getFlagRoutePenalty(candidate, step, targets.length);
+
+          const moveCost = result.distanceKm + result.durationMin / 12;
+          const nextCost =
+            state.cost +
+            moveCost +
+            repeatAreaPenalty +
+            areaSwitchPenalty +
+            gradePenalty +
+            flagPenalty;
+
+          const nextVisitedAreas = new Set(state.visitedAreas);
+          nextVisitedAreas.add(candidateArea);
+
+          const nextAreaExitCount = { ...state.areaExitCount };
+          if (changedArea && state.currentArea !== startArea) {
+            nextAreaExitCount[state.currentArea] =
+              (nextAreaExitCount[state.currentArea] ?? 0) + 1;
+          }
+
+          nextStates.push({
+            route: [...state.route, candidate],
+            remaining: state.remaining.filter((item) => item.id !== candidate.id),
+            currentCoord: candidate.coord,
+            currentArea: candidateArea,
+            visitedAreas: nextVisitedAreas,
+            areaExitCount: nextAreaExitCount,
+            cost: nextCost,
+          });
+        }
+      }
+
+      nextStates.sort((a, b) => a.cost - b.cost);
+      states = nextStates.slice(0, beamWidth);
+    }
+
+    return states[0]?.route ?? targets;
+  };
+
   const sortDispatch = async () => {
     try {
-      setMessage("경로 전체 최적화 계산 중...");
+      setMessage("전체 경로 최적화 계산 중...");
 
       const targets = customers.filter((c) => c.selected);
 
@@ -459,13 +581,12 @@ export default function Home() {
       const startCoord = await geocode(startAddress, "출발지", "장성");
 
       type RouteTarget = Customer & { coord: Coord };
-      type Section = { distanceKm: number; durationMin: number };
 
-      const routeTargets: RouteTarget[] = [];
+      const withCoords: RouteTarget[] = [];
 
       for (const customer of targets) {
         const coord = await geocode(customer.address, customer.name, customer.area);
-        routeTargets.push({
+        withCoords.push({
           ...customer,
           coord,
           distanceKm: null,
@@ -474,186 +595,18 @@ export default function Home() {
         });
       }
 
-      const count = routeTargets.length;
-      const startSections = new Map<number, Section>();
-      const pairSections = new Map<string, Section>();
+      const orderedRoute = await optimizeRouteWithRouteCost(startCoord, withCoords);
 
-      const getPairKey = (fromId: number, toId: number) => `${fromId}->${toId}`;
+      let currentCoord = startCoord;
+      const sectionMap = new Map<number, { distanceKm: number; durationMin: number }>();
 
-      // 1) 출발지 → 모든 업체 거리/시간을 먼저 계산
-      for (const target of routeTargets) {
-        const result = await getDistance(startCoord, target.coord);
-        startSections.set(target.id, {
-          distanceKm: result.distanceKm,
-          durationMin: result.durationMin,
+      for (const customer of orderedRoute) {
+        const section = await getDistance(currentCoord, customer.coord);
+        sectionMap.set(customer.id, {
+          distanceKm: Math.round(section.distanceKm * 10) / 10,
+          durationMin: section.durationMin,
         });
-      }
-
-      // 2) 업체 ↔ 업체 전체 거리/시간 매트릭스 계산
-      //    등급 색상, 지역명, 목포/나주 같은 그룹은 경로 점수에 반영하지 않음.
-      for (let i = 0; i < count; i++) {
-        for (let j = 0; j < count; j++) {
-          if (i === j) continue;
-
-          const from = routeTargets[i];
-          const to = routeTargets[j];
-          const result = await getDistance(from.coord, to.coord);
-
-          pairSections.set(getPairKey(from.id, to.id), {
-            distanceKm: result.distanceKm,
-            durationMin: result.durationMin,
-          });
-        }
-      }
-
-      const getSection = (fromId: number | "start", toId: number): Section => {
-        if (fromId === "start") {
-          return startSections.get(toId) ?? { distanceKm: 9999, durationMin: 9999 };
-        }
-
-        return pairSections.get(getPairKey(fromId, toId)) ?? {
-          distanceKm: 9999,
-          durationMin: 9999,
-        };
-      };
-
-      const getTravelCost = (fromId: number | "start", toId: number) => {
-        const section = getSection(fromId, toId);
-        // 카카오내비 느낌을 위해 시간 중심 + 거리 보조로 전체 경로를 평가
-        return section.durationMin * 1.0 + section.distanceKm * 0.35;
-      };
-
-      const getRouteCost = (ids: number[]) => {
-        if (ids.length === 0) return 0;
-
-        let total = getTravelCost("start", ids[0]);
-
-        for (let i = 1; i < ids.length; i++) {
-          total += getTravelCost(ids[i - 1], ids[i]);
-        }
-
-        return total;
-      };
-
-      const buildNearestRoute = (firstId?: number) => {
-        const remaining = new Set(routeTargets.map((target) => target.id));
-        const route: number[] = [];
-        let current: number | "start" = "start";
-
-        if (firstId != null && remaining.has(firstId)) {
-          route.push(firstId);
-          remaining.delete(firstId);
-          current = firstId;
-        }
-
-        while (remaining.size > 0) {
-          let bestId: number | null = null;
-          let bestScore = Number.POSITIVE_INFINITY;
-
-          for (const candidateId of remaining) {
-            const score = getTravelCost(current, candidateId);
-
-            if (score < bestScore) {
-              bestScore = score;
-              bestId = candidateId;
-            }
-          }
-
-          if (bestId == null) break;
-
-          route.push(bestId);
-          remaining.delete(bestId);
-          current = bestId;
-        }
-
-        return route;
-      };
-
-      const twoOpt = (route: number[]) => {
-        let bestRoute = [...route];
-        let bestCost = getRouteCost(bestRoute);
-        let improved = true;
-        let loopGuard = 0;
-
-        while (improved && loopGuard < 80) {
-          improved = false;
-          loopGuard += 1;
-
-          for (let i = 0; i < bestRoute.length - 1; i++) {
-            for (let j = i + 1; j < bestRoute.length; j++) {
-              const candidate = [
-                ...bestRoute.slice(0, i),
-                ...bestRoute.slice(i, j + 1).reverse(),
-                ...bestRoute.slice(j + 1),
-              ];
-
-              const candidateCost = getRouteCost(candidate);
-
-              if (candidateCost + 0.01 < bestCost) {
-                bestRoute = candidate;
-                bestCost = candidateCost;
-                improved = true;
-              }
-            }
-          }
-        }
-
-        return bestRoute;
-      };
-
-      // 3) 시작 후보를 여러 개로 돌려보고, 전체 경로 비용이 가장 낮은 순서를 선택
-      const startCandidates = [...routeTargets]
-        .sort((a, b) => getTravelCost("start", a.id) - getTravelCost("start", b.id))
-        .slice(0, Math.min(count, 8))
-        .map((target) => target.id);
-
-      let bestRouteIds = twoOpt(buildNearestRoute());
-      let bestRouteCost = getRouteCost(bestRouteIds);
-
-      for (const firstId of startCandidates) {
-        const candidateRoute = twoOpt(buildNearestRoute(firstId));
-        const candidateCost = getRouteCost(candidateRoute);
-
-        if (candidateCost < bestRouteCost) {
-          bestRouteIds = candidateRoute;
-          bestRouteCost = candidateCost;
-        }
-      }
-
-      const targetMap = new Map(routeTargets.map((target) => [target.id, target]));
-      const orderedRoute = bestRouteIds
-        .map((id) => targetMap.get(id))
-        .filter(Boolean) as RouteTarget[];
-
-      const sectionMap = new Map<number, Section>();
-
-      // 4) 최종 순서가 정해진 뒤 카카오 다중 경유지 기준으로 구간 거리/시간 재계산
-      try {
-        const sections = await getWholeRouteSections(
-          startCoord,
-          orderedRoute.map((customer) => customer.coord)
-        );
-
-        orderedRoute.forEach((customer, index) => {
-          const section = sections[index];
-          if (!section) return;
-
-          sectionMap.set(customer.id, {
-            distanceKm: Math.round(section.distanceKm * 10) / 10,
-            durationMin: section.durationMin,
-          });
-        });
-      } catch {
-        // 다중 경유지 API가 실패하면 매트릭스에서 계산한 구간값 사용
-        orderedRoute.forEach((customer, index) => {
-          const previousId = index === 0 ? "start" : orderedRoute[index - 1].id;
-          const section = getSection(previousId, customer.id);
-
-          sectionMap.set(customer.id, {
-            distanceKm: Math.round(section.distanceKm * 10) / 10,
-            durationMin: section.durationMin,
-          });
-        });
+        currentCoord = customer.coord;
       }
 
       const finalRoute: Customer[] = orderedRoute.map((customer) => {
@@ -697,8 +650,7 @@ export default function Home() {
               forklift: routed.forklift,
               assignedTo: customer.assignedTo ?? routed.assignedTo ?? "",
               startedAt: customer.startedAt ?? routed.startedAt ?? null,
-              unloadingMin:
-                customer.unloadingMin ?? routed.unloadingMin ?? DEFAULT_UNLOADING_MIN,
+              unloadingMin: customer.unloadingMin ?? routed.unloadingMin ?? DEFAULT_UNLOADING_MIN,
               distanceKm: routed.distanceKm,
               durationMin: routed.durationMin,
               coordWarning: routed.coordWarning,
@@ -714,7 +666,7 @@ export default function Home() {
         })
       );
 
-      setMessage("경로 전체 최적화 계산 완료");
+      setMessage("전체 경로 최적화 완료");
     } catch (err: any) {
       setMessage(err.message || "API 호출 실패");
     }
