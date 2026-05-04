@@ -447,7 +447,7 @@ export default function Home() {
 
   const sortDispatch = async () => {
     try {
-      setMessage("카카오내비 AI추천 방식으로 자연 경로 계산 중...");
+      setMessage("카카오내비 흐름 기준 자연 경로 계산 중...");
 
       const targets = customers.filter((c) => c.selected);
 
@@ -462,60 +462,88 @@ export default function Home() {
         coord: Coord;
         startDistanceKm: number;
         startDurationMin: number;
+        progress: number;
+        side: number;
       };
 
       const toNumber = (value: string) => Number(value || 0);
 
-      const getBearing = (from: Coord, to: Coord) => {
-        const fromLat = (toNumber(from.y) * Math.PI) / 180;
-        const toLat = (toNumber(to.y) * Math.PI) / 180;
-        const diffLng = ((toNumber(to.x) - toNumber(from.x)) * Math.PI) / 180;
+      const getPoint = (coord: Coord) => ({
+        x: toNumber(coord.x),
+        y: toNumber(coord.y),
+      });
 
-        const y = Math.sin(diffLng) * Math.cos(toLat);
-        const x =
-          Math.cos(fromLat) * Math.sin(toLat) -
-          Math.sin(fromLat) * Math.cos(toLat) * Math.cos(diffLng);
+      const getRouteAxis = (items: { coord: Coord; startDistanceKm: number }[]) => {
+        const start = getPoint(startCoord);
+        const farthest = [...items].sort((a, b) => b.startDistanceKm - a.startDistanceKm)[0];
+        const end = farthest ? getPoint(farthest.coord) : start;
 
-        return (Math.atan2(y, x) * 180) / Math.PI;
+        const vx = end.x - start.x;
+        const vy = end.y - start.y;
+        const len = Math.sqrt(vx * vx + vy * vy) || 1;
+
+        return {
+          start,
+          ux: vx / len,
+          uy: vy / len,
+        };
       };
 
-      const getBearingDiff = (a: number, b: number) => {
-        const diff = Math.abs(a - b) % 360;
-        return diff > 180 ? 360 - diff : diff;
+      const getProgressInfo = (coord: Coord, axis: ReturnType<typeof getRouteAxis>) => {
+        const point = getPoint(coord);
+        const dx = point.x - axis.start.x;
+        const dy = point.y - axis.start.y;
+
+        const progress = dx * axis.ux + dy * axis.uy;
+        const side = Math.abs(dx * axis.uy - dy * axis.ux);
+
+        return { progress, side };
       };
 
       const getFlagPenalty = (customer: Customer) => {
-        // 강제 그룹핑 아님. 자연 경로를 유지하면서 살짝만 반영.
-        if (customer.forklift) return 25;
-        if (customer.productionDoor) return -6;
-        if (customer.urgent) return -4;
+        // 색상 등급은 경로에 절대 반영하지 않음.
+        // 체크 옵션만 아주 약하게 반영해서 경로가 심하게 꼬이지 않게 함.
+        if (customer.forklift) return 8;
+        if (customer.productionDoor) return -3;
+        if (customer.urgent) return -2;
         return 0;
       };
 
-      const withCoords: RouteTarget[] = [];
+      const coordTargets: (Customer & { coord: Coord; startDistanceKm: number; startDurationMin: number })[] = [];
 
       for (const customer of targets) {
         const coord = await geocode(customer.address, customer.name, customer.area);
         const startResult = await getDistance(startCoord, coord);
 
-        withCoords.push({
+        coordTargets.push({
           ...customer,
           coord,
           startDistanceKm: startResult.distanceKm,
           startDurationMin: startResult.durationMin,
+        });
+      }
+
+      const axis = getRouteAxis(coordTargets);
+
+      const withCoords: RouteTarget[] = coordTargets.map((customer) => {
+        const info = getProgressInfo(customer.coord, axis);
+
+        return {
+          ...customer,
+          progress: info.progress,
+          side: info.side,
           distanceKm: null,
           durationMin: null,
           coordWarning: false,
-        });
-      }
+        };
+      });
 
       const remaining = [...withCoords];
       const orderedRoute: RouteTarget[] = [];
       const sectionMap = new Map<number, { distanceKm: number; durationMin: number }>();
 
       let currentCoord = startCoord;
-      let currentStartDistance = 0;
-      let currentBearing: number | null = null;
+      let currentProgress = 0;
 
       while (remaining.length > 0) {
         let bestIndex = 0;
@@ -527,20 +555,16 @@ export default function Home() {
           const target = remaining[i];
           const result = await getDistance(currentCoord, target.coord);
 
-          // 현재 위치보다 출발지 쪽으로 많이 되돌아가는 후보는 감점.
-          const backtrackPenalty = Math.max(
-            0,
-            currentStartDistance - target.startDistanceKm - 4
-          ) * 2.2;
+          // 핵심 1: 이미 멀리 내려갔는데 다시 위로 되돌아가는 후보는 강하게 감점.
+          const backtrackPenalty = Math.max(0, currentProgress - target.progress - 0.015) * 900;
 
-          // 이미 진행 중인 큰 방향에서 갑자기 반대로 꺾는 지그재그를 감점.
-          const nextBearing = getBearing(startCoord, target.coord);
-          const bearingPenalty =
-            currentBearing == null
-              ? 0
-              : Math.max(0, getBearingDiff(currentBearing, nextBearing) - 75) * 0.18;
+          // 핵심 2: 현재 진행 방향보다 너무 멀리 앞을 건너뛰는 것도 약하게 감점.
+          const jumpPenalty = Math.max(0, target.progress - currentProgress - 0.22) * 80;
 
-          // 후보를 찍고 난 뒤 다음 후보들과 너무 멀어지는 경우를 줄이는 약한 보정.
+          // 핵심 3: 주행축에서 너무 옆으로 빠졌다가 다시 돌아오는 후보는 약하게 감점.
+          const sidePenalty = target.side * 70;
+
+          // 핵심 4: 다음 후보들과 완전히 떨어지는 선택을 줄임.
           let nextFlowPenalty = 0;
           const others = remaining.filter((_, idx) => idx !== i);
 
@@ -552,15 +576,15 @@ export default function Home() {
               nearestNext = Math.min(nearestNext, nextResult.distanceKm);
             }
 
-            nextFlowPenalty = nearestNext * 0.12;
+            nextFlowPenalty = nearestNext * 0.18;
           }
 
-          // 핵심: 거리만 보지 않고 시간도 같이 반영해서 내비 추천처럼 자연스럽게 선택.
           const score =
-            result.distanceKm +
-            result.durationMin / 8 +
+            result.distanceKm * 1.15 +
+            result.durationMin / 7 +
             backtrackPenalty +
-            bearingPenalty +
+            jumpPenalty +
+            sidePenalty +
             nextFlowPenalty +
             getFlagPenalty(target);
 
@@ -581,11 +605,10 @@ export default function Home() {
         });
 
         currentCoord = next.coord;
-        currentStartDistance = next.startDistanceKm;
-        currentBearing = getBearing(startCoord, next.coord);
+        currentProgress = Math.max(currentProgress, next.progress);
       }
 
-      // 최종 순서가 정해진 뒤, 가능하면 카카오 다중 경유지 경로 기준으로 구간값을 다시 받음.
+      // 최종 순서가 정해진 뒤, 카카오 다중 경유지 경로 기준으로 구간값을 다시 받음.
       try {
         const sections = await getWholeRouteSections(
           startCoord,
@@ -663,7 +686,7 @@ export default function Home() {
         })
       );
 
-      setMessage("AI추천 자연 경로 계산 완료");
+      setMessage("카카오내비 흐름 기준 자연 경로 계산 완료");
     } catch (err: any) {
       setMessage(err.message || "API 호출 실패");
     }
