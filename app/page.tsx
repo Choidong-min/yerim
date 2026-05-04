@@ -121,7 +121,7 @@ const initialCustomers: Customer[] = [
   {
     id: 3,
     area: "전남 목포",
-    name: "채움",
+    name: "채움퍼니처",
     address: "전라남도 목포시 연산로 218",
     grade: "blue",
     selected: false,
@@ -750,7 +750,6 @@ export default function Home() {
     );
     setRouteOrderIds([]);
     setKakaoText("");
-    setPendingOrderTimes({});
     setMessage("배차 초기화 완료");
   };
 
@@ -2358,10 +2357,12 @@ ${selectedCustomers
 
     const cleanInput = (value: string) => {
       return value
-        .replace(/앱|발주|추가|주문|오더/g, "")
+        .replace(/앱|발주|추가|주문|오더|취소/g, "")
+        .replace(/\d+\s*장/g, "")
         .replace(/\d+\.\d+/g, "")
         .replace(/\d{1,2}월\s*\d{1,2}일/g, "")
         .replace(/\d{1,2}\/\d{1,2}/g, "")
+        .replace(/[0-9]/g, "")
         .trim();
     };
 
@@ -2370,6 +2371,33 @@ ${selectedCustomers
         /퍼니처|퍼니쳐|주방가구|씽크공장|씽크|싱크|가구|공장|산업|유통|디자인|하우징|메이드|하우스|종합|주방|kitchen/g,
         "",
       );
+    };
+
+    const makeAliasKeywords = (customerName: string) => {
+      const normalizedName = normalizeText(customerName);
+      const shortName = removeBusinessWords(normalizedName);
+      const manualAliases: Record<string, string[]> = {
+        "리빙&성민": ["리빙", "성민"],
+        "주식회사 힐링캠프": ["힐링", "캠프", "힐링캠프"],
+        "채움": ["채움"],
+        "채움퍼니처": ["채움"],
+        "주식회사 미광퍼니쳐": ["미광"],
+        "미광퍼니쳐": ["미광"],
+      };
+
+      const aliases = new Set<string>([
+        normalizedName,
+        shortName,
+        ...(manualAliases[customerName] ?? []),
+      ]);
+
+      for (let i = 0; i <= shortName.length - 2; i++) {
+        aliases.add(shortName.slice(i, i + 2));
+      }
+
+      return [...aliases]
+        .map((alias) => normalizeText(alias))
+        .filter((alias) => alias.length >= 2);
     };
 
     const firstLineWithoutArea = areaKeywords.reduce(
@@ -2409,6 +2437,14 @@ ${selectedCustomers
         score = 70;
       else if (shortName.length >= 2 && shortInputName.includes(shortName))
         score = 65;
+
+      const aliasMatched = makeAliasKeywords(customer.name).some((alias) => {
+        return inputName.includes(alias) || shortInputName.includes(alias);
+      });
+
+      if (aliasMatched) {
+        score = Math.max(score, 85);
+      }
 
       if (score > bestScore) {
         bestScore = score;
@@ -2766,17 +2802,17 @@ ${selectedCustomers
 
   return (
     <main style={page}>
-      <section style={startBox}>
-        <label style={label}>출발지 주소</label>
-        <input
-          value={startAddress}
-          onChange={(e) => setStartAddress(e.target.value)}
-          onBlur={() => setStartAddress((prev) => normalizeAddress(prev))}
-          style={input}
-        />
-      </section>
-
       <div style={topButtonRow}>
+        <div style={startInlineBox}>
+          <label style={startInlineLabel}>출발지</label>
+          <input
+            value={startAddress}
+            onChange={(e) => setStartAddress(e.target.value)}
+            onBlur={() => setStartAddress((prev) => normalizeAddress(prev))}
+            style={startInlineInput}
+          />
+        </div>
+
         <button onClick={sortDispatch} style={primaryButton}>
           거리 계산해서 배차 정렬
         </button>
@@ -3276,6 +3312,35 @@ const startBox: React.CSSProperties = {
   border: "1px solid #e5e7eb",
   borderRadius: 12,
   boxShadow: "0 4px 14px rgba(15,23,42,0.06)",
+};
+
+const startInlineBox: React.CSSProperties = {
+  width: "33.333%",
+  display: "flex",
+  alignItems: "center",
+  gap: 8,
+  padding: "6px 9px",
+  background: "rgba(255,255,255,0.95)",
+  border: "1px solid #e5e7eb",
+  borderRadius: 10,
+  boxSizing: "border-box",
+};
+
+const startInlineLabel: React.CSSProperties = {
+  flex: "0 0 auto",
+  fontWeight: 900,
+  fontSize: 11,
+  color: "#334155",
+};
+
+const startInlineInput: React.CSSProperties = {
+  flex: 1,
+  minWidth: 0,
+  border: "none",
+  outline: "none",
+  background: "transparent",
+  fontSize: 12,
+  color: "#111827",
 };
 
 const topButtonRow: React.CSSProperties = {
