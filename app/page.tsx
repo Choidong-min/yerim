@@ -447,7 +447,7 @@ export default function Home() {
 
   const sortDispatch = async () => {
     try {
-      setMessage("거리 기준 자동 배차 계산 중...");
+      setMessage("카카오내비 AI추천 방식으로 자연 경로 계산 중...");
 
       const targets = customers.filter((c) => c.selected);
 
@@ -458,70 +458,151 @@ export default function Home() {
 
       const startCoord = await geocode(startAddress, "출발지", "장성");
 
-      type RouteTarget = Customer & { coord: Coord };
+      type RouteTarget = Customer & {
+        coord: Coord;
+        startDistanceKm: number;
+        startDurationMin: number;
+      };
+
+      const toNumber = (value: string) => Number(value || 0);
+
+      const getBearing = (from: Coord, to: Coord) => {
+        const fromLat = (toNumber(from.y) * Math.PI) / 180;
+        const toLat = (toNumber(to.y) * Math.PI) / 180;
+        const diffLng = ((toNumber(to.x) - toNumber(from.x)) * Math.PI) / 180;
+
+        const y = Math.sin(diffLng) * Math.cos(toLat);
+        const x =
+          Math.cos(fromLat) * Math.sin(toLat) -
+          Math.sin(fromLat) * Math.cos(toLat) * Math.cos(diffLng);
+
+        return (Math.atan2(y, x) * 180) / Math.PI;
+      };
+
+      const getBearingDiff = (a: number, b: number) => {
+        const diff = Math.abs(a - b) % 360;
+        return diff > 180 ? 360 - diff : diff;
+      };
+
+      const getFlagPenalty = (customer: Customer) => {
+        // 강제 그룹핑 아님. 자연 경로를 유지하면서 살짝만 반영.
+        if (customer.forklift) return 25;
+        if (customer.productionDoor) return -6;
+        if (customer.urgent) return -4;
+        return 0;
+      };
 
       const withCoords: RouteTarget[] = [];
 
       for (const customer of targets) {
         const coord = await geocode(customer.address, customer.name, customer.area);
+        const startResult = await getDistance(startCoord, coord);
+
         withCoords.push({
           ...customer,
           coord,
+          startDistanceKm: startResult.distanceKm,
+          startDurationMin: startResult.durationMin,
           distanceKm: null,
           durationMin: null,
           coordWarning: false,
         });
       }
 
-      const productionDoor = withCoords.filter(
-        (c) => c.productionDoor && !c.forklift
-      );
-      const urgent = withCoords.filter(
-        (c) => !c.productionDoor && c.urgent && !c.forklift
-      );
-      const normal = withCoords.filter(
-        (c) => !c.productionDoor && !c.urgent && !c.forklift
-      );
-      const forklift = withCoords.filter((c) => c.forklift);
-
-      const groups = [productionDoor, urgent, normal, forklift];
-
-      let currentCoord = startCoord;
+      const remaining = [...withCoords];
       const orderedRoute: RouteTarget[] = [];
       const sectionMap = new Map<number, { distanceKm: number; durationMin: number }>();
 
-      for (const group of groups) {
-        const remaining = [...group];
+      let currentCoord = startCoord;
+      let currentStartDistance = 0;
+      let currentBearing: number | null = null;
 
-        while (remaining.length > 0) {
-          let bestIndex = 0;
-          let bestDistance = Number.POSITIVE_INFINITY;
-          let bestDuration = 0;
-          let bestScore = Number.POSITIVE_INFINITY;
+      while (remaining.length > 0) {
+        let bestIndex = 0;
+        let bestScore = Number.POSITIVE_INFINITY;
+        let bestDistance = 0;
+        let bestDuration = 0;
 
-          for (let i = 0; i < remaining.length; i++) {
-            const target = remaining[i];
-            const result = await getDistance(currentCoord, target.coord);
-            const score = result.distanceKm + gradePreferencePenalty[target.grade];
+        for (let i = 0; i < remaining.length; i++) {
+          const target = remaining[i];
+          const result = await getDistance(currentCoord, target.coord);
 
-            if (score < bestScore) {
-              bestScore = score;
-              bestDistance = result.distanceKm;
-              bestDuration = result.durationMin;
-              bestIndex = i;
+          // 현재 위치보다 출발지 쪽으로 많이 되돌아가는 후보는 감점.
+          const backtrackPenalty = Math.max(
+            0,
+            currentStartDistance - target.startDistanceKm - 4
+          ) * 2.2;
+
+          // 이미 진행 중인 큰 방향에서 갑자기 반대로 꺾는 지그재그를 감점.
+          const nextBearing = getBearing(startCoord, target.coord);
+          const bearingPenalty =
+            currentBearing == null
+              ? 0
+              : Math.max(0, getBearingDiff(currentBearing, nextBearing) - 75) * 0.18;
+
+          // 후보를 찍고 난 뒤 다음 후보들과 너무 멀어지는 경우를 줄이는 약한 보정.
+          let nextFlowPenalty = 0;
+          const others = remaining.filter((_, idx) => idx !== i);
+
+          if (others.length > 0) {
+            let nearestNext = Number.POSITIVE_INFINITY;
+
+            for (const other of others) {
+              const nextResult = await getDistance(target.coord, other.coord);
+              nearestNext = Math.min(nearestNext, nextResult.distanceKm);
             }
+
+            nextFlowPenalty = nearestNext * 0.12;
           }
 
-          const [next] = remaining.splice(bestIndex, 1);
+          // 핵심: 거리만 보지 않고 시간도 같이 반영해서 내비 추천처럼 자연스럽게 선택.
+          const score =
+            result.distanceKm +
+            result.durationMin / 8 +
+            backtrackPenalty +
+            bearingPenalty +
+            nextFlowPenalty +
+            getFlagPenalty(target);
 
-          orderedRoute.push(next);
-          sectionMap.set(next.id, {
-            distanceKm: Math.round(bestDistance * 10) / 10,
-            durationMin: bestDuration,
-          });
-
-          currentCoord = next.coord;
+          if (score < bestScore) {
+            bestScore = score;
+            bestIndex = i;
+            bestDistance = result.distanceKm;
+            bestDuration = result.durationMin;
+          }
         }
+
+        const [next] = remaining.splice(bestIndex, 1);
+
+        orderedRoute.push(next);
+        sectionMap.set(next.id, {
+          distanceKm: Math.round(bestDistance * 10) / 10,
+          durationMin: bestDuration,
+        });
+
+        currentCoord = next.coord;
+        currentStartDistance = next.startDistanceKm;
+        currentBearing = getBearing(startCoord, next.coord);
+      }
+
+      // 최종 순서가 정해진 뒤, 가능하면 카카오 다중 경유지 경로 기준으로 구간값을 다시 받음.
+      try {
+        const sections = await getWholeRouteSections(
+          startCoord,
+          orderedRoute.map((customer) => customer.coord)
+        );
+
+        orderedRoute.forEach((customer, index) => {
+          const section = sections[index];
+          if (!section) return;
+
+          sectionMap.set(customer.id, {
+            distanceKm: Math.round(section.distanceKm * 10) / 10,
+            durationMin: section.durationMin,
+          });
+        });
+      } catch {
+        // 다중 경유지 계산이 실패하면 위에서 계산한 구간별 값 그대로 사용
       }
 
       const finalRoute: Customer[] = orderedRoute.map((customer) => {
@@ -565,7 +646,8 @@ export default function Home() {
               forklift: routed.forklift,
               assignedTo: customer.assignedTo ?? routed.assignedTo ?? "",
               startedAt: customer.startedAt ?? routed.startedAt ?? null,
-              unloadingMin: customer.unloadingMin ?? routed.unloadingMin ?? DEFAULT_UNLOADING_MIN,
+              unloadingMin:
+                customer.unloadingMin ?? routed.unloadingMin ?? DEFAULT_UNLOADING_MIN,
               distanceKm: routed.distanceKm,
               durationMin: routed.durationMin,
               coordWarning: routed.coordWarning,
@@ -581,7 +663,7 @@ export default function Home() {
         })
       );
 
-      setMessage("거리 계산 완료");
+      setMessage("AI추천 자연 경로 계산 완료");
     } catch (err: any) {
       setMessage(err.message || "API 호출 실패");
     }
