@@ -121,7 +121,7 @@ const initialCustomers: Customer[] = [
   {
     id: 3,
     area: "전남 목포",
-    name: "채움퍼니처",
+    name: "채움",
     address: "전라남도 목포시 연산로 218",
     grade: "blue",
     selected: false,
@@ -1822,6 +1822,10 @@ export default function Home() {
   const getEtaMin = (targetIndex: number) => {
     if (targetIndex < 0) return null;
 
+    // 15번째 업체까지만 예상 도착시간 계산
+    // 16번째부터는 하루 배차 현실상 계산하지 않음
+    if (targetIndex >= 15) return null;
+
     const startedIndex = selectedCustomers.findIndex(
       (customer) => customer.startedAt,
     );
@@ -1833,11 +1837,18 @@ export default function Home() {
 
     for (let i = baseIndex; i <= targetIndex; i++) {
       const customer = selectedCustomers[i];
-      total += customer.durationMin ?? 0;
+      const moveMin = customer.durationMin;
 
-      if (i < targetIndex) {
+      // 구간 시간이 없으면 예상 도착시간도 미계산 처리
+      if (moveMin == null) return null;
+
+      // 첫 업체는 출발지 → 첫 업체 이동시간만 계산
+      // 두 번째 업체부터는 이전 업체 하차시간 15분을 먼저 더하고 다음 업체 이동시간 계산
+      if (i > baseIndex) {
         total += DEFAULT_UNLOADING_MIN;
       }
+
+      total += moveMin;
     }
 
     return Math.round(total);
