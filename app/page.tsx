@@ -95,6 +95,12 @@ const ASSIGNEES = [
   "기사님4",
 ];
 
+const CUSTOMER_ADDRESS_FIXES: Record<string, string> = {
+  // 업체명이 같은 장소로 잘못 잡히는 것을 막기 위해
+  // 등록 주소를 우선 사용합니다.
+  // 실제 현장 주소가 다르면 화면의 업체 수정에서 주소만 바꾸면 됩니다.
+};
+
 const initialCustomers: Customer[] = [
   {
     id: 1,
@@ -537,6 +543,7 @@ export default function Home() {
         setCustomers(
           parsed.map((c: Customer) => ({
             ...c,
+            address: getFixedCustomerAddress(c.name, c.address),
             selected: false,
             productionDoor: false,
             urgent: false,
@@ -586,6 +593,7 @@ export default function Home() {
     try {
       const saveData = customers.map((c) => ({
         ...c,
+        address: getFixedCustomerAddress(c.name, c.address),
         selected: false,
         productionDoor: false,
         urgent: false,
@@ -690,6 +698,40 @@ export default function Home() {
       .trim();
   };
 
+  const getFixedCustomerAddress = (name = "", address = "") => {
+    const fixed = CUSTOMER_ADDRESS_FIXES[name.trim()];
+    return normalizeAddress(fixed || address);
+  };
+
+  const normalizeDrivingDuration = (distanceKm: number, apiDurationMin: number) => {
+    const distance = Number(distanceKm);
+    const apiMinutes = Number(apiDurationMin);
+
+    if (!Number.isFinite(distance) || distance <= 0) {
+      return Number.isFinite(apiMinutes) && apiMinutes > 0 ? Math.round(apiMinutes) : 0;
+    }
+
+    let estimatedMin = 0;
+
+    if (distance >= 70) estimatedMin = distance * 0.9;
+    else if (distance >= 50) estimatedMin = distance * 1.0;
+    else if (distance >= 20) estimatedMin = distance * 1.15;
+    else if (distance >= 5) estimatedMin = distance * 1.4;
+    else estimatedMin = Math.max(1, distance * 2);
+
+    if (!Number.isFinite(apiMinutes) || apiMinutes <= 0) {
+      return Math.max(1, Math.round(estimatedMin));
+    }
+
+    // 카카오 경로 시간이 실제 운행 대비 과하게 튀는 경우만 현장 기준 예상시간으로 보정.
+    // 예: 장성 출발 → 목포권 약 78km가 2시간 이상으로 잡히는 문제 방지.
+    if (distance >= 50 && apiMinutes > estimatedMin * 1.35) {
+      return Math.max(1, Math.round(estimatedMin));
+    }
+
+    return Math.max(1, Math.round(apiMinutes));
+  };
+
   const updateCustomer = (
     id: number,
     field: "selected" | "productionDoor" | "urgent" | "forklift",
@@ -758,7 +800,7 @@ export default function Home() {
     name?: string,
     area?: string,
   ): Promise<Coord> => {
-    const baseAddress = normalizeAddress(address);
+    const baseAddress = normalizeAddress(getFixedCustomerAddress(name, address));
     const cacheKey = `${baseAddress}|${name || ""}|${area || ""}`;
     const cached = coordCacheRef.current.get(cacheKey);
     if (cached) return cached;
@@ -766,55 +808,23 @@ export default function Home() {
     const makeRequests = () => {
       const requests: { address: string; name?: string; area?: string }[] = [];
 
-      // 1순위: 원래 등록 주소 그대로
-      requests.push({ address: baseAddress, name, area });
-
-      // 2순위: 주소 + 업체명
-      if (name) {
-        requests.push({ address: `${baseAddress} ${name}`, name, area });
+      // 핵심 수정:
+      // 주소가 등록돼 있으면 업체명 검색을 섞지 않고 주소만 먼저 사용합니다.
+      // 업체명 검색을 섞으면 카카오가 비슷한 업체명/같은 건물 결과를 잡아서
+      // 힐링캠프, 채움처럼 서로 같은 좌표로 붙는 문제가 생깁니다.
+      if (baseAddress) {
+        requests.push({ address: baseAddress, name: undefined, area });
+        return requests;
       }
 
-      // 3순위: 지역 + 업체명
-      if (name && area) {
-        requests.push({ address: `${area} ${name}`, name, area });
-      }
+      // 주소가 비어 있을 때만 업체명 검색을 보조로 사용합니다.
+      if (name && area) requests.push({ address: `${area} ${name}`, name, area });
 
-      // 4순위: 시/군 단위 + 업체명
       const simpleArea = area?.replace("전남 ", "").trim();
-      if (name && simpleArea) {
-        requests.push({ address: `${simpleArea} ${name}`, name, area });
-      }
+      if (name && simpleArea) requests.push({ address: `${simpleArea} ${name}`, name, area });
 
-      // 5순위: 업체명만 검색
-      if (name) {
-        requests.push({ address: name, name, area });
-      }
+      if (name) requests.push({ address: name, name, area });
 
-      // 6순위: 괄호/특수문자 제거 업체명 검색
-      if (name) {
-        const cleanName = name
-          .replace(/주식회사|유한회사|유\)|\(유\)|㈜|주\)/g, "")
-          .replace(/[()&.·\-_\/]/g, " ")
-          .replace(/\s+/g, " ")
-          .trim();
-
-        if (cleanName && cleanName !== name) {
-          requests.push({
-            address: `${baseAddress} ${cleanName}`,
-            name: cleanName,
-            area,
-          });
-          if (area)
-            requests.push({
-              address: `${area} ${cleanName}`,
-              name: cleanName,
-              area,
-            });
-          requests.push({ address: cleanName, name: cleanName, area });
-        }
-      }
-
-      // 중복 제거
       const seen = new Set<string>();
       return requests.filter((request) => {
         const key = `${request.address}|${request.name || ""}|${request.area || ""}`;
@@ -949,9 +959,14 @@ export default function Home() {
     const earlyRatio = total <= 1 ? 0 : 1 - step / (total - 1);
     const positionRatio = total <= 1 ? 1 : step / (total - 1);
 
-    // 레드는 운영상 강한 비선호 대상.
-    // 첫집은 사실상 금지, 중반 이전도 매우 강하게 밀어냄.
-    // 뒤쪽 20~25% 구간에서만 자연스럽게 포함되도록 둠.
+    // 블랙(white)은 초반 선호 유지.
+    // 단, 억지로 먼 곳을 먼저 보내지 않도록 선호값만 적용합니다.
+    if (customer.grade === "white") {
+      return -230 * earlyRatio;
+    }
+
+    // 레드(red)와 미길은 후반 선호 유지.
+    // 첫집/중반 이전은 강하게 밀고, 뒤쪽에서는 자연스럽게 포함합니다.
     if (isRedRouteCustomer(customer)) {
       if (total > 1 && step === 0) return 20000;
       if (positionRatio < 0.5) return 12000 * earlyRatio + 3500;
@@ -959,14 +974,8 @@ export default function Home() {
       return 900 * earlyRatio + 250;
     }
 
-    // 등급은 강제가 아니라 선호값만 줌.
-    // white는 화면상 블랙 등급 역할이라 초반 선호를 더 줌.
-    if (customer.grade === "white") return -230 * earlyRatio;
-    if (customer.grade === "blue") return -65 * earlyRatio;
-    if (customer.grade === "green") return -18 * earlyRatio;
-    if (customer.grade === "amber") return 8 * earlyRatio;
-    if (customer.grade === "yellow") return 28 * earlyRatio;
-
+    // 나머지 등급(blue/green/amber/yellow)은 경로 우선순위에서 제외.
+    // 실제 내비 거리/시간과 같은 생활권 흐름만 따릅니다.
     return 0;
   };
 
@@ -1012,12 +1021,59 @@ export default function Home() {
     return { distanceKm: 9999, durationMin: 9999 };
   };
 
+  const getLocalFlowRank = (customer: Customer) => {
+    const raw = `${customer.area} ${customer.address} ${customer.name}`;
+
+    // 같은 생활권 안에서 내비가 자연스럽게 한 방향으로 빠지도록 하는 보조값.
+    // 블랙(white) 초반 / 레드(red) 후반 기준은 유지하고,
+    // blue/green/amber/yellow 등급은 이 값이 아니라 실제 도로 거리·시간을 우선합니다.
+    // 목포 외 지역(광주/순천 등)은 등록된 좌표 간 실제 내비 시간으로만 판단합니다.
+    if (raw.includes("목포")) {
+      if (raw.includes("로얄씽크") || raw.includes("삼학로")) return 10;
+      if (raw.includes("리빙") || raw.includes("성민")) return 20;
+      if (raw.includes("하울") || raw.includes("제이원") || raw.includes("고하대로")) return 30;
+      if (raw.includes("공간디자인") || raw.includes("공단중앙로")) return 40;
+      if (raw.includes("채움") || raw.includes("어울림") || raw.includes("포이닉스") || raw.includes("연산로") || raw.includes("원산로")) return 50;
+      if (raw.includes("힐링") || raw.includes("대양로")) return 60;
+    }
+
+    return null;
+  };
+
+  const getLocalFlowPenalty = (previous: Customer | null, next: Customer) => {
+    if (!previous) return 0;
+
+    const previousArea = getRouteAreaKey(previous);
+    const nextArea = getRouteAreaKey(next);
+
+    if (previousArea !== nextArea) return 0;
+
+    const previousRank = getLocalFlowRank(previous);
+    const nextRank = getLocalFlowRank(next);
+
+    if (previousRank == null || nextRank == null) return 0;
+
+    // 같은 생활권에서 끝방향으로 나갔다가 다시 안쪽으로 되돌아오는 코스 차단.
+    // 예: 힐링캠프 방문 후 하울/공간/채움으로 복귀하는 흐름 방지.
+    if (nextRank < previousRank) {
+      return (previousRank - nextRank) * 120;
+    }
+
+    // 한 방향으로 빠지는 흐름은 약하게 선호하되, 실제 내비 시간이 우선입니다.
+    if (nextRank > previousRank) {
+      return -8;
+    }
+
+    return 0;
+  };
+
   const evaluateRouteScore = <T extends Customer & { coord: Coord }>(
     startCoord: Coord,
     route: T[],
   ) => {
     let currentCoord = startCoord;
     let currentArea = "출발지";
+    let previousCustomer: Customer | null = null;
     const visitedAreas = new Set<string>([currentArea]);
     const areaExitCount: Record<string, number> = {};
     let totalDistance = 0;
@@ -1040,6 +1096,7 @@ export default function Home() {
       const repeatAreaPenalty = returnedArea ? 210 + exitedCount * 90 : 0;
       const areaSwitchPenalty = changedArea && step > 0 ? 4 : 0;
       const flowPenalty = getAreaFlowPenalty(currentArea, candidateArea);
+      const localFlowPenalty = getLocalFlowPenalty(previousCustomer, customer);
       const gradePenalty = getGradeRoutePenalty(customer, step, route.length);
       const flagPenalty = getFlagRoutePenalty(customer, step, route.length);
       const moveCost = result.distanceKm + result.durationMin / 10;
@@ -1051,6 +1108,7 @@ export default function Home() {
         repeatAreaPenalty +
         areaSwitchPenalty +
         flowPenalty +
+        localFlowPenalty +
         gradePenalty +
         flagPenalty;
 
@@ -1061,6 +1119,7 @@ export default function Home() {
       visitedAreas.add(candidateArea);
       currentArea = candidateArea;
       currentCoord = customer.coord;
+      previousCustomer = customer;
     }
 
     return { score, totalDistance, totalDuration };
@@ -1072,6 +1131,7 @@ export default function Home() {
   ) => {
     let currentCoord = startCoord;
     let currentArea = "출발지";
+    let previousCustomer: Customer | null = null;
     const visitedAreas = new Set<string>([currentArea]);
     const areaExitCount: Record<string, number> = {};
     let score = 0;
@@ -1090,10 +1150,11 @@ export default function Home() {
       const repeatAreaPenalty = returnedArea ? 210 + exitedCount * 90 : 0;
       const areaSwitchPenalty = changedArea && step > 0 ? 2 : 0;
       const flowPenalty = getAreaFlowPenalty(currentArea, candidateArea);
+      const localFlowPenalty = getLocalFlowPenalty(previousCustomer, customer);
       const moveCost = result.distanceKm + result.durationMin / 10;
 
       // 미세 순서 보정은 등급보다 실제 주행 흐름을 우선함.
-      score += moveCost + repeatAreaPenalty + areaSwitchPenalty + flowPenalty;
+      score += moveCost + repeatAreaPenalty + areaSwitchPenalty + flowPenalty + localFlowPenalty;
 
       if (changedArea && currentArea !== "출발지") {
         areaExitCount[currentArea] = (areaExitCount[currentArea] ?? 0) + 1;
@@ -1102,6 +1163,7 @@ export default function Home() {
       visitedAreas.add(candidateArea);
       currentArea = candidateArea;
       currentCoord = customer.coord;
+      previousCustomer = customer;
     }
 
     return score;
@@ -1301,6 +1363,8 @@ export default function Home() {
           const repeatAreaPenalty = returnedArea ? 210 + exitedCount * 90 : 0;
           const areaSwitchPenalty = changedArea && step > 0 ? 4 : 0;
           const flowPenalty = getAreaFlowPenalty(state.currentArea, candidateArea);
+          const previousCustomer = state.route.length > 0 ? state.route[state.route.length - 1] : null;
+          const localFlowPenalty = getLocalFlowPenalty(previousCustomer, candidate);
           const gradePenalty = getGradeRoutePenalty(
             candidate,
             step,
@@ -1319,6 +1383,7 @@ export default function Home() {
             repeatAreaPenalty +
             areaSwitchPenalty +
             flowPenalty +
+            localFlowPenalty +
             gradePenalty +
             flagPenalty;
 
@@ -1435,6 +1500,17 @@ export default function Home() {
     await prefetchRouteDistances(startCoord, targets);
 
     const candidates = getCandidateRoutes(startCoord, targets);
+
+    // 8곳 이하 배차는 모든 순서를 직접 비교합니다.
+    // Kakao 내비 구간 시간/거리 캐시를 기준으로 비교하므로 목포뿐 아니라 광주·순천도 그대로 적용됩니다.
+    // 단, 레드 업체가 첫집으로 잡히는 경우만 제외합니다.
+    if (targets.length <= 8) {
+      for (const permutation of getPermutations(targets)) {
+        if (permutation.length > 1 && isRedRouteCustomer(permutation[0])) continue;
+        candidates.push(permutation);
+      }
+    }
+
     let bestRoute = candidates[0] ?? targets;
     let bestScore = evaluateRouteScore(startCoord, bestRoute).score;
 
@@ -1597,7 +1673,7 @@ export default function Home() {
 
           if (!shouldRefineWindow(window)) continue;
 
-          const currentScore = evaluateRouteTravelScore(startCoord, bestRoute);
+          const currentScore = evaluateRouteScore(startCoord, bestRoute).score;
           let localBest = bestRoute;
           let localBestScore = currentScore;
 
@@ -1607,10 +1683,10 @@ export default function Home() {
               ...permutation,
               ...afterWindow,
             ];
-            const candidateScore = evaluateRouteTravelScore(
+            const candidateScore = evaluateRouteScore(
               startCoord,
               candidateRoute,
-            );
+            ).score;
 
             if (candidateScore + 0.3 < localBestScore) {
               localBest = candidateRoute;
@@ -1720,14 +1796,15 @@ export default function Home() {
       let currentCoord = startCoord;
       const sectionMap = new Map<
         number,
-        { distanceKm: number; durationMin: number }
+        { distanceKm: number; durationMin: number; coordWarning: boolean }
       >();
 
       for (const customer of orderedRoute) {
         const section = await getDistance(currentCoord, customer.coord);
         sectionMap.set(customer.id, {
           distanceKm: Math.round(section.distanceKm * 10) / 10,
-          durationMin: section.durationMin,
+          durationMin: normalizeDrivingDuration(section.distanceKm, section.durationMin),
+          coordWarning: Boolean(customer.coord.fallback) || section.distanceKm >= 180,
         });
         currentCoord = customer.coord;
       }
@@ -1751,9 +1828,7 @@ export default function Home() {
           unloadingMin: DEFAULT_UNLOADING_MIN,
           distanceKm: section?.distanceKm ?? null,
           durationMin: section?.durationMin ?? null,
-          coordWarning:
-            (section?.distanceKm ?? 0) <= 0.2 ||
-            (section?.distanceKm ?? 0) >= 180,
+          coordWarning: Boolean(section?.coordWarning),
         };
       });
 
@@ -2703,7 +2778,7 @@ ${selectedCustomers
       let currentCoord = await geocode(startAddress, "출발지", "장성");
       const sectionMap = new Map<
         number,
-        { distanceKm: number; durationMin: number }
+        { distanceKm: number; durationMin: number; coordWarning: boolean }
       >();
 
       for (const customer of orderedCustomers) {
@@ -2716,7 +2791,8 @@ ${selectedCustomers
 
         sectionMap.set(customer.id, {
           distanceKm: Math.round(result.distanceKm * 10) / 10,
-          durationMin: result.durationMin,
+          durationMin: normalizeDrivingDuration(result.distanceKm, result.durationMin),
+          coordWarning: Boolean(targetCoord.fallback) || result.distanceKm >= 180,
         });
 
         currentCoord = targetCoord;
@@ -2741,8 +2817,7 @@ ${selectedCustomers
             ...customer,
             distanceKm: section.distanceKm,
             durationMin: section.durationMin,
-            coordWarning:
-              section.distanceKm <= 0.2 || section.distanceKm >= 180,
+            coordWarning: section.coordWarning,
           };
         }),
       );
