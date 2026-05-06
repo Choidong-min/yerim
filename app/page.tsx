@@ -45,6 +45,13 @@ type MobileDispatchItem = {
   unloadingMin: number;
 };
 
+type MobileOrder = {
+  id: string;
+  name: string;
+  text: string;
+  createdAt: string;
+};
+
 type SavedDispatchItem = {
   id: number;
   order: number;
@@ -81,6 +88,8 @@ const areas = [
 
 const STORAGE_KEY = "delivery_customers_v2";
 const MOBILE_DISPATCH_KEY = "delivery_mobile_dispatch_v1";
+const MOBILE_ORDER_PROCESSED_KEY = "delivery_mobile_orders_processed_v1";
+const SALES_MOBILE_ORDERS_KEY = "delivery_sales_mobile_orders_v1";
 const DISPATCH_SLOTS_KEY = "delivery_dispatch_slots_v1";
 const MAX_DISPATCH_SLOTS = 8;
 const DEFAULT_UNLOADING_MIN = 15;
@@ -507,6 +516,21 @@ export default function Home() {
   const [pendingOrderTimes, setPendingOrderTimes] = useState<
     Record<number, string>
   >({});
+  const [pendingOrderSources, setPendingOrderSources] = useState<
+    Record<number, string>
+  >({});
+  const [pendingOrderSourceNames, setPendingOrderSourceNames] = useState<
+    Record<number, string>
+  >({});
+  const [pendingOrderRawTexts, setPendingOrderRawTexts] = useState<
+    Record<number, string>
+  >({});
+  const [editingPendingOrderId, setEditingPendingOrderId] = useState<number | null>(null);
+  const [editingPendingOrderText, setEditingPendingOrderText] = useState("");
+  const [salesMobileOrders, setSalesMobileOrders] = useState<MobileOrder[]>([]);
+  const [editingSalesMobileOrderId, setEditingSalesMobileOrderId] = useState<string | null>(null);
+  const [editingSalesMobileOrderText, setEditingSalesMobileOrderText] = useState("");
+  const processedMobileOrderIdsRef = useRef<Set<string>>(new Set());
   const [draggedId, setDraggedId] = useState<number | null>(null);
   const [routeOrderIds, setRouteOrderIds] = useState<number[]>([]);
   const [priorityRecalcKey, setPriorityRecalcKey] = useState(0);
@@ -562,6 +586,47 @@ export default function Home() {
       localStorage.removeItem(STORAGE_KEY);
     }
   }, []);
+
+  useEffect(() => {
+    try {
+      const saved = localStorage.getItem(MOBILE_ORDER_PROCESSED_KEY);
+      const parsed = saved ? JSON.parse(saved) : [];
+      if (Array.isArray(parsed)) {
+        processedMobileOrderIdsRef.current = new Set(parsed.map(String));
+      }
+    } catch {
+      localStorage.removeItem(MOBILE_ORDER_PROCESSED_KEY);
+    }
+  }, []);
+
+  useEffect(() => {
+    try {
+      const saved = localStorage.getItem(SALES_MOBILE_ORDERS_KEY);
+      const parsed = saved ? JSON.parse(saved) : [];
+      if (Array.isArray(parsed)) {
+        setSalesMobileOrders(
+          parsed
+            .filter((order: MobileOrder) => order?.id && order?.text)
+            .map((order: MobileOrder) => ({
+              id: String(order.id),
+              name: String(order.name ?? ""),
+              text: String(order.text ?? ""),
+              createdAt: String(order.createdAt ?? ""),
+            })),
+        );
+      }
+    } catch {
+      localStorage.removeItem(SALES_MOBILE_ORDERS_KEY);
+    }
+  }, []);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(SALES_MOBILE_ORDERS_KEY, JSON.stringify(salesMobileOrders));
+    } catch {
+      // 영업사원 발주 저장 실패 시 화면은 그대로 유지
+    }
+  }, [salesMobileOrders]);
 
   useEffect(() => {
     try {
@@ -663,7 +728,7 @@ export default function Home() {
   };
 
   const pendingAllCustomers = pendingOrderIds
-    .map((id) => customers.find((c) => c.id === id && !c.selected))
+    .map((id) => customers.find((c) => c.id === id))
     .filter(Boolean) as Customer[];
 
   const pendingCustomers = pendingAllCustomers.filter(
@@ -708,7 +773,7 @@ export default function Home() {
     const apiMinutes = Number(apiDurationMin);
 
     if (!Number.isFinite(distance) || distance <= 0) {
-      return Number.isFinite(apiMinutes) && apiMinutes > 0 ? Math.round(apiMinutes) : 0;
+      return Number.isFinite(apiMinutes) && apiMinutes > 0 ? Math.max(1, Math.round(apiMinutes)) : 0;
     }
 
     let estimatedMin = 0;
@@ -719,18 +784,53 @@ export default function Home() {
     else if (distance >= 5) estimatedMin = distance * 1.4;
     else estimatedMin = Math.max(1, distance * 2);
 
-    if (!Number.isFinite(apiMinutes) || apiMinutes <= 0) {
-      return Math.max(1, Math.round(estimatedMin));
-    }
+    const rawMin =
+      !Number.isFinite(apiMinutes) || apiMinutes <= 0
+        ? Math.max(1, Math.round(estimatedMin))
+        : Math.max(1, Math.round(apiMinutes));
+
+    // 너무 가까운 업체 간 이동이 0~1분으로 표시되면 실제 상차/골목/신호 시간이 반영되지 않아
+    // 2번째 업체부터 예상도착이 과하게 짧아지는 문제가 있어 최소 구간 시간을 보정합니다.
+    if (distance <= 0.5) return Math.max(rawMin, 3);
+    if (distance <= 1) return Math.max(rawMin, 4);
+    if (distance <= 2) return Math.max(rawMin, 5);
+    if (distance <= 3) return Math.max(rawMin, 7);
 
     // 카카오 경로 시간이 실제 운행 대비 과하게 튀는 경우만 현장 기준 예상시간으로 보정.
     // 예: 장성 출발 → 목포권 약 78km가 2시간 이상으로 잡히는 문제 방지.
-    if (distance >= 50 && apiMinutes > estimatedMin * 1.35) {
+    if (distance >= 50 && rawMin > estimatedMin * 1.35) {
       return Math.max(1, Math.round(estimatedMin));
     }
 
-    return Math.max(1, Math.round(apiMinutes));
+    return rawMin;
   };
+
+
+
+  const applyManualRouteSectionFix = (
+    fromCustomer: Customer | null,
+    toCustomer: Customer,
+    section: { distanceKm: number; durationMin: number },
+  ) => {
+    const fromName = fromCustomer?.name ?? "";
+    const toName = toCustomer.name ?? "";
+
+    // 카카오 좌표/거리 API가 아주 가까운 업체를 0km로 반환하는 경우 보정.
+    // 실제 카카오내비 기준: 채움 ↔ 힐링캠프 약 1.3km
+    const isChaeumHealing =
+      (fromName.includes("채움") && toName.includes("힐링")) ||
+      (fromName.includes("힐링") && toName.includes("채움"));
+
+    if (isChaeumHealing && section.distanceKm < 1.3) {
+      return {
+        distanceKm: 1.3,
+        durationMin: Math.max(section.durationMin, 5),
+      };
+    }
+
+    return section;
+  };
+
 
   const updateCustomer = (
     id: number,
@@ -1794,19 +1894,26 @@ export default function Home() {
       }
 
       let currentCoord = startCoord;
+      let previousRouteCustomer: Customer | null = null;
       const sectionMap = new Map<
         number,
         { distanceKm: number; durationMin: number; coordWarning: boolean }
       >();
 
       for (const customer of orderedRoute) {
-        const section = await getDistance(currentCoord, customer.coord);
+        const rawSection = await getDistance(currentCoord, customer.coord);
+        const section = applyManualRouteSectionFix(
+          previousRouteCustomer,
+          customer,
+          rawSection,
+        );
         sectionMap.set(customer.id, {
           distanceKm: Math.round(section.distanceKm * 10) / 10,
           durationMin: normalizeDrivingDuration(section.distanceKm, section.durationMin),
-          coordWarning: Boolean(customer.coord.fallback) || section.distanceKm >= 180,
+          coordWarning: Boolean(customer.coord.fallback) || rawSection.distanceKm >= 180,
         });
         currentCoord = customer.coord;
+        previousRouteCustomer = customer;
       }
 
       const finalRoute: Customer[] = orderedRoute.map((customer) => {
@@ -2548,19 +2655,30 @@ ${selectedCustomers
     return `${hour}:${minute}`;
   };
 
-  const applyKakaoText = () => {
-    const count = parseJangCount(kakaoText);
-    const matchedCustomer = findCustomerFromKakaoText(kakaoText);
-    const isCancel = kakaoText.includes("취소");
-    const isAdd = kakaoText.includes("추가");
+  const processOrderText = (
+    rawText: string,
+    options?: { sourceName?: string; sourceTime?: string; clearInput?: boolean; keepEditorOpen?: boolean },
+  ) => {
+    const text = rawText.trim();
+    const count = parseJangCount(text);
+    const matchedCustomer = findCustomerFromKakaoText(text);
+    const isCancel = text.includes("취소");
+    const isAdd = text.includes("추가");
+    const sourceName = options?.sourceName?.trim() ?? "";
+    const sourceTime = options?.sourceTime?.trim() || getCurrentTimeText();
+    const sourceLabel = sourceName ? `${sourceTime} ${sourceName}` : sourceTime;
 
     if (!matchedCustomer) {
       setMessage(
-        count > 0
-          ? `총 ${count}장 인식 / 업체 자동매칭 실패`
-          : "업체 자동매칭 실패",
+        sourceName
+          ? count > 0
+            ? `모바일 ${sourceName} / 총 ${count}장 인식 / 업체 자동매칭 실패`
+            : `모바일 ${sourceName} / 업체 자동매칭 실패`
+          : count > 0
+            ? `총 ${count}장 인식 / 업체 자동매칭 실패`
+            : "업체 자동매칭 실패",
       );
-      return;
+      return false;
     }
 
     setSelectedArea(matchedCustomer.area);
@@ -2570,36 +2688,88 @@ ${selectedCustomers
       const updatedSlot = updateDispatchSlotByKakao(matchedCustomer, count, "cancel");
 
       if (!updatedSlot) {
+        let removed = false;
+
         setOrderCounts((prev) => {
           const currentCount = prev[matchedCustomer.id] ?? 0;
           const nextCount = count > 0 ? Math.max(0, currentCount - count) : 0;
           const next = { ...prev };
-          if (nextCount <= 0) delete next[matchedCustomer.id];
-          else next[matchedCustomer.id] = nextCount;
+          if (nextCount <= 0) {
+            delete next[matchedCustomer.id];
+            removed = true;
+          } else {
+            next[matchedCustomer.id] = nextCount;
+          }
           return next;
         });
 
-        if (count <= 0) {
+        if (count <= 0 || removed) {
           setPendingOrderIds((prev) =>
             prev.filter((pendingId) => pendingId !== matchedCustomer.id),
           );
+          setPendingOrderTimes((prev) => {
+            const next = { ...prev };
+            delete next[matchedCustomer.id];
+            return next;
+          });
+          setPendingOrderSources((prev) => {
+            const next = { ...prev };
+            delete next[matchedCustomer.id];
+            return next;
+          });
+          setPendingOrderSourceNames((prev) => {
+            const next = { ...prev };
+            delete next[matchedCustomer.id];
+            return next;
+          });
+          setPendingOrderRawTexts((prev) => {
+            const next = { ...prev };
+            delete next[matchedCustomer.id];
+            return next;
+          });
+          if (editingPendingOrderId === matchedCustomer.id) {
+            setEditingPendingOrderId(null);
+            setEditingPendingOrderText("");
+          }
+        } else {
+          setPendingOrderSources((prev) => {
+            if (!sourceName && prev[matchedCustomer.id]) return prev;
+            return {
+              ...prev,
+              [matchedCustomer.id]: sourceLabel,
+            };
+          });
+          setPendingOrderSourceNames((prev) => {
+            if (!sourceName && prev[matchedCustomer.id]) return prev;
+            return {
+              ...prev,
+              [matchedCustomer.id]: sourceName,
+            };
+          });
+          setPendingOrderRawTexts((prev) => {
+            if (!sourceName && prev[matchedCustomer.id]) return prev;
+            return {
+              ...prev,
+              [matchedCustomer.id]: text,
+            };
+          });
         }
 
         setMessage(
           count > 0
-            ? `${matchedCustomer.area.replace("전남 ", "")} ${matchedCustomer.name} 취소 ${count}장 반영 완료`
-            : `${matchedCustomer.area.replace("전남 ", "")} ${matchedCustomer.name} 전체 취소 완료`,
+            ? `${sourceName ? `모바일 ${sourceName} / ` : ""}${matchedCustomer.area.replace("전남 ", "")} ${matchedCustomer.name} 취소 ${count}장 반영 완료`
+            : `${sourceName ? `모바일 ${sourceName} / ` : ""}${matchedCustomer.area.replace("전남 ", "")} ${matchedCustomer.name} 전체 취소 완료`,
         );
-        setKakaoText("");
+        if (options?.clearInput !== false) setKakaoText("");
       }
-      return;
+      return true;
     }
 
     const actionCount = count > 0 ? count : 0;
 
     if (isAdd && actionCount > 0) {
       const updatedSlot = updateDispatchSlotByKakao(matchedCustomer, actionCount, "add");
-      if (updatedSlot) return;
+      if (updatedSlot) return true;
     }
 
     if (count > 0) {
@@ -2609,30 +2779,193 @@ ${selectedCustomers
       }));
     }
 
-    if (!matchedCustomer.selected) {
-      setPendingOrderIds((prev) =>
-        prev.includes(matchedCustomer.id)
-          ? prev
-          : [...prev, matchedCustomer.id],
-      );
-      setPendingOrderTimes((prev) =>
-        prev[matchedCustomer.id]
-          ? prev
-          : { ...prev, [matchedCustomer.id]: getCurrentTimeText() },
-      );
-    }
+    // 카톡 붙여넣기에서 등록한 발주는 이미 선택리스트에 있는 업체라도
+    // 경리가 확인할 수 있도록 미배차 대기함에 반드시 표시합니다.
+    setPendingOrderIds((prev) =>
+      prev.includes(matchedCustomer.id)
+        ? prev
+        : [...prev, matchedCustomer.id],
+    );
+    setPendingOrderTimes((prev) =>
+      prev[matchedCustomer.id]
+        ? prev
+        : { ...prev, [matchedCustomer.id]: sourceTime },
+    );
+    setPendingOrderSources((prev) => {
+      if (!sourceName && prev[matchedCustomer.id]) return prev;
+      return {
+        ...prev,
+        [matchedCustomer.id]: sourceLabel,
+      };
+    });
+    setPendingOrderSourceNames((prev) => {
+      if (!sourceName && prev[matchedCustomer.id]) return prev;
+      return {
+        ...prev,
+        [matchedCustomer.id]: sourceName,
+      };
+    });
+    setPendingOrderRawTexts((prev) => {
+      if (!sourceName && prev[matchedCustomer.id]) return prev;
+      return {
+        ...prev,
+        [matchedCustomer.id]: text,
+      };
+    });
 
     setMessage(
-      matchedCustomer.selected
-        ? count > 0
-          ? `${matchedCustomer.area.replace("전남 ", "")} ${matchedCustomer.name} 추가 ${count}장 반영 완료`
-          : `${matchedCustomer.area.replace("전남 ", "")} ${matchedCustomer.name} 추가 확인 완료`
-        : count > 0
-          ? `${matchedCustomer.area.replace("전남 ", "")} ${matchedCustomer.name} ${count}장 미배차 등록 완료`
-          : `${matchedCustomer.area.replace("전남 ", "")} ${matchedCustomer.name} 업체명만 미배차 등록 완료`,
+      count > 0
+        ? `${sourceName ? `모바일 ${sourceName} / ` : ""}${matchedCustomer.area.replace("전남 ", "")} ${matchedCustomer.name} ${count}장 미배차 등록 완료`
+        : `${sourceName ? `모바일 ${sourceName} / ` : ""}${matchedCustomer.area.replace("전남 ", "")} ${matchedCustomer.name} 업체명만 미배차 등록 완료`,
     );
-    setKakaoText("");
+    if (options?.clearInput !== false) setKakaoText("");
+    return true;
   };
+
+  const applyKakaoText = () => {
+    processOrderText(kakaoText, { clearInput: true });
+  };
+
+  const openPendingOrderEditor = (customer: Customer) => {
+    setEditingPendingOrderId(customer.id);
+    setEditingPendingOrderText(pendingOrderRawTexts[customer.id] ?? "");
+  };
+
+  const applyPendingOrderEdit = (customer: Customer) => {
+    const nextText = editingPendingOrderText.trim();
+    if (!nextText) {
+      alert("수정할 카톡 발주 내용을 입력하세요.");
+      return;
+    }
+
+    const sourceName = pendingOrderSourceNames[customer.id] ?? "";
+    const sourceTime = pendingOrderTimes[customer.id] ?? getCurrentTimeText();
+
+    setPendingOrderIds((prev) => prev.filter((pendingId) => pendingId !== customer.id));
+    setPendingOrderTimes((prev) => {
+      const next = { ...prev };
+      delete next[customer.id];
+      return next;
+    });
+    setPendingOrderSources((prev) => {
+      const next = { ...prev };
+      delete next[customer.id];
+      return next;
+    });
+    setPendingOrderSourceNames((prev) => {
+      const next = { ...prev };
+      delete next[customer.id];
+      return next;
+    });
+    setPendingOrderRawTexts((prev) => {
+      const next = { ...prev };
+      delete next[customer.id];
+      return next;
+    });
+    setOrderCounts((prev) => {
+      const next = { ...prev };
+      delete next[customer.id];
+      return next;
+    });
+
+    processOrderText(nextText, {
+      sourceName,
+      sourceTime,
+      clearInput: false,
+      keepEditorOpen: false,
+    });
+
+    setEditingPendingOrderId(null);
+    setEditingPendingOrderText("");
+    setMessage("모바일 발주 수정 반영 완료");
+  };
+
+  const getSalesMobileOrderCustomer = (order: MobileOrder) => {
+    return findCustomerFromKakaoText(order.text);
+  };
+
+  const getSalesMobileOrderTitle = (order: MobileOrder) => {
+    const matchedCustomer = getSalesMobileOrderCustomer(order);
+    const areaName = matchedCustomer?.area.replace("전남 ", "") ?? "업체확인";
+    const customerName = matchedCustomer?.name ?? "업체명 확인필요";
+    return `${order.createdAt ? `${order.createdAt} ` : ""}${areaName} ${customerName}${order.name ? ` - ${order.name}` : ""}`;
+  };
+
+  const openSalesMobileOrderEditor = (order: MobileOrder) => {
+    setEditingSalesMobileOrderId(order.id);
+    setEditingSalesMobileOrderText(order.text);
+  };
+
+  const applySalesMobileOrderEdit = (orderId: string) => {
+    const nextText = editingSalesMobileOrderText.trim();
+    if (!nextText) {
+      alert("수정할 발주 내용을 입력하세요.");
+      return;
+    }
+
+    setSalesMobileOrders((prev) =>
+      prev.map((order) =>
+        order.id === orderId ? { ...order, text: nextText } : order,
+      ),
+    );
+    setEditingSalesMobileOrderId(null);
+    setEditingSalesMobileOrderText("");
+    setMessage("영업사원 발주 수정 완료");
+  };
+
+  const deleteSalesMobileOrder = (orderId: string) => {
+    if (!confirm("영업사원 발주를 삭제할까요?")) return;
+
+    setSalesMobileOrders((prev) => prev.filter((order) => order.id !== orderId));
+    if (editingSalesMobileOrderId === orderId) {
+      setEditingSalesMobileOrderId(null);
+      setEditingSalesMobileOrderText("");
+    }
+    setMessage("영업사원 발주 삭제 완료");
+  };
+
+  const copySalesMobileOrder = async (text: string) => {
+    await navigator.clipboard.writeText(text);
+    setMessage("영업사원 발주 내용 복사 완료");
+  };
+
+  useEffect(() => {
+    const fetchMobileOrders = async () => {
+      try {
+        const res = await fetch("/api/mobile-orders", { cache: "no-store" });
+        if (!res.ok) return;
+
+        const data = await res.json();
+        const orders = Array.isArray(data.orders) ? (data.orders as MobileOrder[]) : [];
+        const newOrders = orders
+          .filter((order) => order?.id && !processedMobileOrderIdsRef.current.has(order.id))
+          .reverse();
+
+        if (newOrders.length === 0) return;
+
+        setSalesMobileOrders((prev) => {
+          const existingIds = new Set(prev.map((order) => order.id));
+          const incomingOrders = newOrders.filter((order) => !existingIds.has(order.id));
+          return [...prev, ...incomingOrders].slice(-200);
+        });
+
+        for (const order of newOrders) {
+          processedMobileOrderIdsRef.current.add(order.id);
+        }
+
+        localStorage.setItem(
+          MOBILE_ORDER_PROCESSED_KEY,
+          JSON.stringify([...processedMobileOrderIdsRef.current].slice(-500)),
+        );
+      } catch {
+        // 모바일 발주 조회 실패 시 기존 PC 화면은 그대로 유지
+      }
+    };
+
+    fetchMobileOrders();
+    const timer = window.setInterval(fetchMobileOrders, 2000);
+    return () => window.clearInterval(timer);
+  }, [customers, salesMobileOrders]);
 
   const movePendingToDispatch = (id: number) => {
     setCustomers((prev) =>
@@ -2646,6 +2979,25 @@ ${selectedCustomers
       delete next[id];
       return next;
     });
+    setPendingOrderSources((prev) => {
+      const next = { ...prev };
+      delete next[id];
+      return next;
+    });
+    setPendingOrderSourceNames((prev) => {
+      const next = { ...prev };
+      delete next[id];
+      return next;
+    });
+    setPendingOrderRawTexts((prev) => {
+      const next = { ...prev };
+      delete next[id];
+      return next;
+    });
+    if (editingPendingOrderId === id) {
+      setEditingPendingOrderId(null);
+      setEditingPendingOrderText("");
+    }
     setRouteOrderIds((prev) => (prev.includes(id) ? prev : [...prev, id]));
     setMessage("미배차에서 배차리스트로 이동 완료");
   };
@@ -2657,6 +3009,25 @@ ${selectedCustomers
       delete next[id];
       return next;
     });
+    setPendingOrderSources((prev) => {
+      const next = { ...prev };
+      delete next[id];
+      return next;
+    });
+    setPendingOrderSourceNames((prev) => {
+      const next = { ...prev };
+      delete next[id];
+      return next;
+    });
+    setPendingOrderRawTexts((prev) => {
+      const next = { ...prev };
+      delete next[id];
+      return next;
+    });
+    if (editingPendingOrderId === id) {
+      setEditingPendingOrderId(null);
+      setEditingPendingOrderText("");
+    }
     setOrderCounts((prev) => {
       const next = { ...prev };
       delete next[id];
@@ -2776,6 +3147,7 @@ ${selectedCustomers
       if (orderedCustomers.length === 0) return;
 
       let currentCoord = await geocode(startAddress, "출발지", "장성");
+      let previousRouteCustomer: Customer | null = null;
       const sectionMap = new Map<
         number,
         { distanceKm: number; durationMin: number; coordWarning: boolean }
@@ -2787,15 +3159,21 @@ ${selectedCustomers
           customer.name,
           customer.area,
         );
-        const result = await getDistance(currentCoord, targetCoord);
+        const rawResult = await getDistance(currentCoord, targetCoord);
+        const result = applyManualRouteSectionFix(
+          previousRouteCustomer,
+          customer,
+          rawResult,
+        );
 
         sectionMap.set(customer.id, {
           distanceKm: Math.round(result.distanceKm * 10) / 10,
           durationMin: normalizeDrivingDuration(result.distanceKm, result.durationMin),
-          coordWarning: Boolean(targetCoord.fallback) || result.distanceKm >= 180,
+          coordWarning: Boolean(targetCoord.fallback) || rawResult.distanceKm >= 180,
         });
 
         currentCoord = targetCoord;
+        previousRouteCustomer = customer;
       }
 
       setCustomers((prev) =>
@@ -2956,22 +3334,47 @@ ${selectedCustomers
           {pendingCustomers.map((customer) => {
             const count = orderCounts[customer.id] ?? 0;
             const registeredTime = pendingOrderTimes[customer.id];
+            const registeredName = pendingOrderSourceNames[customer.id];
+            const rawText = pendingOrderRawTexts[customer.id];
+            const isEditing = editingPendingOrderId === customer.id;
+            const displayText = `${registeredTime ? `${registeredTime} ` : ""}${customer.area.replace("전남 ", "")} ${customer.name}${registeredName ? ` - ${registeredName}` : ""}`;
 
             return (
               <div key={customer.id} style={pendingRow}>
-                <label style={pendingCheckItem}>
+                <div style={pendingTextRow}>
                   <input
                     type="checkbox"
                     checked={false}
                     onChange={() => movePendingToDispatch(customer.id)}
                   />
-                  <span
-                    style={{ color: getColor(customer.grade), fontWeight: 900 }}
+                  <button
+                    type="button"
+                    onClick={() => movePendingToDispatch(customer.id)}
+                    style={{
+                      border: "none",
+                      background: "transparent",
+                      padding: 0,
+                      color: getColor(customer.grade),
+                      fontWeight: 900,
+                      textAlign: "left",
+                      cursor: "pointer",
+                    }}
                   >
-                    {registeredTime ? `${registeredTime} ` : ""}
-                    {customer.area.replace("전남 ", "")} {customer.name}
-                  </span>
-                </label>
+                    {displayText}
+                  </button>
+                  {rawText && (
+                    <button
+                      type="button"
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        openPendingOrderEditor(customer);
+                      }}
+                      style={pendingConfirmButton}
+                    >
+                      내용
+                    </button>
+                  )}
+                </div>
 
                 <div style={pendingActionBox}>
                   <span style={pendingCount}>
@@ -2985,6 +3388,38 @@ ${selectedCustomers
                     삭제
                   </button>
                 </div>
+
+                {isEditing && (
+                  <div style={pendingEditBox}>
+                    <div style={pendingEditTitle}>
+                      모바일 카톡 원본 확인/수정
+                    </div>
+                    <textarea
+                      value={editingPendingOrderText}
+                      onChange={(event) => setEditingPendingOrderText(event.target.value)}
+                      style={pendingEditTextarea}
+                    />
+                    <div style={pendingEditButtonRow}>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setEditingPendingOrderId(null);
+                          setEditingPendingOrderText("");
+                        }}
+                        style={pendingEditCancelButton}
+                      >
+                        닫기
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => applyPendingOrderEdit(customer)}
+                        style={pendingEditApplyButton}
+                      >
+                        완료
+                      </button>
+                    </div>
+                  </div>
+                )}
               </div>
             );
           })}
@@ -3163,6 +3598,99 @@ ${selectedCustomers
 
             </div>
           ))}
+
+          <div style={salesOrderPanel}>
+            <h3 style={sectionTitle}>영업사원발주</h3>
+            <p style={hint}>모바일 발주 확인 후 경리가 카톡붙여넣기에 복사 등록하고 삭제</p>
+
+            {salesMobileOrders.length === 0 && (
+              <p style={{ color: "#64748b", fontSize: 12 }}>
+                영업사원 발주가 없습니다.
+              </p>
+            )}
+
+            {salesMobileOrders.map((order) => {
+              const isEditing = editingSalesMobileOrderId === order.id;
+
+              return (
+                <div key={order.id} style={pendingRow}>
+                  <div style={pendingTextRow}>
+                    <button
+                      type="button"
+                      onClick={() => openSalesMobileOrderEditor(order)}
+                      style={{
+                        border: "none",
+                        background: "transparent",
+                        padding: 0,
+                        color: "#1d4ed8",
+                        fontWeight: 900,
+                        textAlign: "left",
+                        cursor: "pointer",
+                      }}
+                    >
+                      {getSalesMobileOrderTitle(order)}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => openSalesMobileOrderEditor(order)}
+                      style={pendingConfirmButton}
+                    >
+                      내용
+                    </button>
+                  </div>
+
+                  <div style={pendingActionBox}>
+                    <button
+                      type="button"
+                      onClick={() => copySalesMobileOrder(order.text)}
+                      style={salesOrderCopyButton}
+                    >
+                      복사
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => deleteSalesMobileOrder(order.id)}
+                      style={pendingDeleteButton}
+                    >
+                      삭제
+                    </button>
+                  </div>
+
+                  {isEditing && (
+                    <div style={pendingEditBox}>
+                      <div style={pendingEditTitle}>
+                        영업사원 카톡 원본 확인/수정
+                      </div>
+                      <textarea
+                        value={editingSalesMobileOrderText}
+                        onChange={(event) => setEditingSalesMobileOrderText(event.target.value)}
+                        style={pendingEditTextarea}
+                      />
+                      <div style={pendingEditButtonRow}>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setEditingSalesMobileOrderId(null);
+                            setEditingSalesMobileOrderText("");
+                          }}
+                          style={pendingEditCancelButton}
+                        >
+                          닫기
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => applySalesMobileOrderEdit(order.id)}
+                          style={pendingEditApplyButton}
+                        >
+                          완료
+                        </button>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
         </section>
 
         <section>
@@ -3939,6 +4467,7 @@ const pendingRow: React.CSSProperties = {
   padding: "8px 6px",
   borderBottom: "1px solid #eef2f7",
   fontSize: 12,
+  flexWrap: "wrap",
 };
 
 const pendingCheckItem: React.CSSProperties = {
@@ -3970,6 +4499,67 @@ const pendingDeleteButton: React.CSSProperties = {
   fontWeight: 900,
   cursor: "pointer",
   fontSize: 10,
+};
+
+
+const pendingEditBox: React.CSSProperties = {
+  width: "100%",
+  marginTop: 6,
+  padding: 8,
+  borderRadius: 9,
+  border: "1px solid #bfdbfe",
+  background: "#eff6ff",
+};
+
+const pendingEditTitle: React.CSSProperties = {
+  marginBottom: 6,
+  color: "#1d4ed8",
+  fontSize: 11,
+  fontWeight: 900,
+};
+
+const pendingEditTextarea: React.CSSProperties = {
+  width: "100%",
+  minHeight: 88,
+  boxSizing: "border-box",
+  padding: 8,
+  borderRadius: 8,
+  border: "1px solid #93c5fd",
+  background: "#ffffff",
+  color: "#111827",
+  fontSize: 12,
+  lineHeight: 1.45,
+  resize: "vertical",
+  outline: "none",
+};
+
+const pendingEditButtonRow: React.CSSProperties = {
+  display: "flex",
+  justifyContent: "flex-end",
+  gap: 6,
+  marginTop: 7,
+};
+
+const pendingEditCancelButton: React.CSSProperties = {
+  padding: "5px 9px",
+  borderRadius: 7,
+  border: "1px solid #cbd5e1",
+  background: "#ffffff",
+  color: "#334155",
+  fontWeight: 900,
+  cursor: "pointer",
+  fontSize: 11,
+};
+
+const pendingEditApplyButton: React.CSSProperties = {
+  padding: "5px 10px",
+  borderRadius: 7,
+  border: "none",
+  background: "#2563eb",
+  color: "#ffffff",
+  fontWeight: 900,
+  cursor: "pointer",
+  fontSize: 11,
 };
 
 const customerPickerToggle: React.CSSProperties = {
@@ -4086,6 +4676,43 @@ const pendingRightActions: React.CSSProperties = {
   alignItems: "center",
   gap: 6,
   marginLeft: "auto",
+};
+
+const pendingTextRow: React.CSSProperties = {
+  display: "flex",
+  alignItems: "center",
+  gap: 7,
+  flex: 1,
+  minWidth: 0,
+};
+
+const salesOrderPanel: React.CSSProperties = {
+  marginTop: 14,
+  paddingTop: 14,
+  borderTop: "1px solid #e2e8f0",
+};
+
+const salesOrderCopyButton: React.CSSProperties = {
+  padding: "6px 10px",
+  borderRadius: 8,
+  border: "1px solid #bfdbfe",
+  background: "#eff6ff",
+  color: "#1d4ed8",
+  fontWeight: 900,
+  cursor: "pointer",
+  fontSize: 12,
+};
+
+const pendingConfirmButton: React.CSSProperties = {
+  padding: "4px 7px",
+  borderRadius: 8,
+  border: "1px solid #bfdbfe",
+  background: "#eff6ff",
+  color: "#1d4ed8",
+  fontSize: 11,
+  fontWeight: 900,
+  cursor: "pointer",
+  flexShrink: 0,
 };
 
 
