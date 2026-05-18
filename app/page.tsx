@@ -63,6 +63,11 @@ type SavedDispatchItem = {
   distanceKm: number | null;
   durationMin: number | null;
   etaMin: number | null;
+  startedAt?: string | null;
+  unloadedAt?: string;
+  unloadedBy?: string;
+  unloadDone?: boolean;
+  released?: boolean;
 };
 
 type SavedDispatchSlot = {
@@ -73,6 +78,26 @@ type SavedDispatchSlot = {
   totalOrderCount: number;
   copyText: string;
   driverName?: string;
+  startedAt?: string | null;
+  mobileConfirmedAt?: string;
+  mobileConfirmedBy?: string;
+  mobileReleasedAt?: string;
+  mobileReleasedBy?: string;
+};
+
+type MobileDispatchSlotPayload = {
+  slot: number;
+  createdAt: string;
+  driverName: string;
+  items: SavedDispatchItem[];
+  totalDistance: number;
+  totalOrderCount: number;
+  copyText: string;
+  startedAt?: string | null;
+  mobileConfirmedAt?: string;
+  mobileConfirmedBy?: string;
+  mobileReleasedAt?: string;
+  mobileReleasedBy?: string;
 };
 
 type DispatchSlotNumber = 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8;
@@ -543,6 +568,7 @@ export default function Home() {
   const distanceCacheRef = useRef<
     Map<string, { distanceKm: number; durationMin: number }>
   >(new Map());
+  const mobileKnownSlotNumbersRef = useRef<Set<number>>(new Set());
 
   const [form, setForm] = useState({
     id: 0,
@@ -653,6 +679,175 @@ export default function Home() {
       // 배차지정 저장 실패 시 화면은 그대로 유지
     }
   }, [dispatchSlots]);
+
+  const normalizeMobileSlotItems = (
+    items: any[],
+    fallbackItems: SavedDispatchItem[],
+    fallbackDriverName = "",
+  ): SavedDispatchItem[] => {
+    const fallbackMap = new Map(fallbackItems.map((item) => [Number(item.id), item]));
+
+    return items.map((rawItem, index) => {
+      const id = Number(rawItem.id ?? index + 1);
+      const fallbackItem = fallbackMap.get(id);
+      const unloadDone = Boolean(rawItem.unloadDone ?? rawItem.unloadedAt ?? rawItem.unloadDoneAt);
+      const unloadedAt = rawItem.unloadedAt ?? rawItem.unloadDoneAt ?? fallbackItem?.unloadedAt;
+      const unloadedBy =
+        rawItem.unloadedBy ??
+        rawItem.unloadDoneBy ??
+        rawItem.driverName ??
+        rawItem.assignedTo ??
+        fallbackItem?.unloadedBy ??
+        fallbackDriverName;
+
+      return {
+        id,
+        order: Number(rawItem.order ?? fallbackItem?.order ?? index + 1),
+        area: String(rawItem.area ?? fallbackItem?.area ?? "").replace("전남 ", ""),
+        name: String(rawItem.name ?? rawItem.customer ?? fallbackItem?.name ?? ""),
+        grade: (rawItem.grade ?? fallbackItem?.grade ?? "white") as Grade,
+        count: Number(rawItem.count ?? fallbackItem?.count ?? 0),
+        forklift: Boolean(rawItem.forklift ?? fallbackItem?.forklift ?? false),
+        distanceKm:
+          rawItem.distanceKm == null
+            ? fallbackItem?.distanceKm ?? null
+            : Number(rawItem.distanceKm),
+        durationMin:
+          rawItem.durationMin == null
+            ? fallbackItem?.durationMin ?? null
+            : Number(rawItem.durationMin),
+        etaMin:
+          rawItem.etaMin == null ? fallbackItem?.etaMin ?? null : Number(rawItem.etaMin),
+        startedAt: rawItem.startedAt ?? fallbackItem?.startedAt ?? null,
+        unloadedAt: unloadDone ? unloadedAt ?? new Date().toISOString() : undefined,
+        unloadedBy: unloadDone ? unloadedBy : undefined,
+        unloadDone,
+        released: Boolean(rawItem.released ?? fallbackItem?.released ?? false),
+      };
+    });
+  };
+
+  useEffect(() => {
+    const fetchConfirmedMobileDispatch = async () => {
+      try {
+        const res = await fetch("/api/mobile-dispatch", { cache: "no-store" });
+        if (!res.ok) return;
+
+        const data = await res.json();
+        const slots = Array.isArray(data.slots) ? (data.slots as MobileDispatchSlotPayload[]) : [];
+        const serverSlotNumbers = new Set(slots.map((item) => Number(item.slot)));
+        const previousServerSlotNumbers = mobileKnownSlotNumbersRef.current;
+
+        setDispatchSlots((prev) =>
+          prev
+            .filter((slot) => {
+              const slotNumber = Number(slot.slot);
+
+              // 아직 모바일에서 배차 확인을 누르지 않은 PC 배차는
+              // PC에서 모바일로 전송 직후에도 절대 삭제하지 않습니다.
+              if (!slot.mobileConfirmedAt) return true;
+
+              // 과거에 서버에서 실제로 확인됐던 배차가
+              // 이번 조회에서 사라졌다면 모바일에서 완료되어 삭제된 것으로 봅니다.
+              if (
+                previousServerSlotNumbers.has(slotNumber) &&
+                !serverSlotNumbers.has(slotNumber)
+              ) {
+                return false;
+              }
+
+              return true;
+            })
+            .map((slot) => {
+              const mobileSlot = slots.find((item) => Number(item.slot) === Number(slot.slot));
+              if (!mobileSlot) return slot;
+
+              const mobileItems = Array.isArray(mobileSlot.items) ? mobileSlot.items : [];
+              const itemConfirmedAt = mobileItems.find((item: any) => item?.confirmedAt)?.confirmedAt;
+              const hasConfirmedItem = mobileItems.some((item: any) => Boolean(item?.confirmed || item?.confirmedAt));
+              const confirmedAt =
+                mobileSlot.mobileConfirmedAt ??
+                itemConfirmedAt ??
+                (hasConfirmedItem ? slot.mobileConfirmedAt ?? new Date().toISOString() : slot.mobileConfirmedAt);
+              const nextItems =
+                mobileItems.length > 0
+                  ? normalizeMobileSlotItems(mobileItems, slot.items, mobileSlot.driverName || slot.driverName || "")
+                  : slot.items;
+
+              const startedAt =
+                mobileSlot.startedAt ??
+                nextItems.find((item) => item.startedAt)?.startedAt ??
+                slot.startedAt ??
+                null;
+              const allReleased = nextItems.length > 0 && nextItems.every((item) => item.released);
+              const mobileReleasedAt =
+                mobileSlot.mobileReleasedAt ??
+                slot.mobileReleasedAt ??
+                (allReleased ? new Date().toISOString() : undefined);
+              const nextUnloadState = nextItems
+                .map(
+                  (item) =>
+                    `${item.id}:${item.startedAt || ""}:${item.unloadedAt || ""}:${item.unloadedBy || ""}:${item.released ? "1" : "0"}`,
+                )
+                .join("|");
+              const currentUnloadState = slot.items
+                .map(
+                  (item) =>
+                    `${item.id}:${item.startedAt || ""}:${item.unloadedAt || ""}:${item.unloadedBy || ""}:${item.released ? "1" : "0"}`,
+                )
+                .join("|");
+
+              if (
+                slot.mobileConfirmedAt === confirmedAt &&
+                slot.mobileReleasedAt === mobileReleasedAt &&
+                slot.startedAt === startedAt &&
+                currentUnloadState === nextUnloadState
+              ) {
+                return slot;
+              }
+
+              return {
+                ...slot,
+                items: nextItems,
+                totalDistance:
+                  Math.round(nextItems.reduce((sum, item) => sum + (item.distanceKm ?? 0), 0) * 10) / 10,
+                totalOrderCount: nextItems.reduce((sum, item) => sum + (item.count ?? 0), 0),
+                copyText: makeDispatchSlotCopyText(
+                  slot.slot,
+                  nextItems,
+                  mobileSlot.driverName || slot.driverName || "",
+                ),
+                driverName: mobileSlot.driverName || slot.driverName,
+                startedAt,
+                mobileConfirmedAt: confirmedAt,
+                mobileConfirmedBy: mobileSlot.mobileConfirmedBy || slot.mobileConfirmedBy,
+                mobileReleasedAt,
+                mobileReleasedBy: mobileSlot.mobileReleasedBy || slot.mobileReleasedBy,
+              };
+            }),
+        );
+
+        setOpenedCompletedSlotNumber((prev) => {
+          if (prev == null) return prev;
+          if (
+            previousServerSlotNumbers.has(Number(prev)) &&
+            !serverSlotNumbers.has(Number(prev))
+          ) {
+            return null;
+          }
+          return prev;
+        });
+
+        mobileKnownSlotNumbersRef.current = serverSlotNumbers;
+      } catch {
+        // 모바일 배차 확인 상태 조회 실패 시 화면은 그대로 유지
+      }
+    };
+
+    fetchConfirmedMobileDispatch();
+    const timer = window.setInterval(fetchConfirmedMobileDispatch, 2000);
+    return () => window.clearInterval(timer);
+  }, []);
 
   useEffect(() => {
     try {
@@ -1059,11 +1254,8 @@ export default function Home() {
     const earlyRatio = total <= 1 ? 0 : 1 - step / (total - 1);
     const positionRatio = total <= 1 ? 1 : step / (total - 1);
 
-    // 블랙(white)은 초반 선호 유지.
-    // 단, 억지로 먼 곳을 먼저 보내지 않도록 선호값만 적용합니다.
-    if (customer.grade === "white") {
-      return -230 * earlyRatio;
-    }
+    // 블랙/white 초반 선호는 제거합니다.
+    // 전국 어디서든 업체명·등급 고정 순서가 아니라 실제 네비 거리/시간 흐름을 우선합니다.
 
     // 레드(red)와 미길은 후반 선호 유지.
     // 첫집/중반 이전은 강하게 밀고, 뒤쪽에서는 자연스럽게 포함합니다.
@@ -1141,30 +1333,20 @@ export default function Home() {
   };
 
   const getLocalFlowPenalty = (previous: Customer | null, next: Customer) => {
-    if (!previous) return 0;
-
-    const previousArea = getRouteAreaKey(previous);
-    const nextArea = getRouteAreaKey(next);
-
-    if (previousArea !== nextArea) return 0;
-
-    const previousRank = getLocalFlowRank(previous);
-    const nextRank = getLocalFlowRank(next);
-
-    if (previousRank == null || nextRank == null) return 0;
-
-    // 같은 생활권에서 끝방향으로 나갔다가 다시 안쪽으로 되돌아오는 코스 차단.
-    // 예: 힐링캠프 방문 후 하울/공간/채움으로 복귀하는 흐름 방지.
-    if (nextRank < previousRank) {
-      return (previousRank - nextRank) * 120;
-    }
-
-    // 한 방향으로 빠지는 흐름은 약하게 선호하되, 실제 내비 시간이 우선입니다.
-    if (nextRank > previousRank) {
-      return -8;
-    }
-
+    // 업체명/지역명 고정 순서 없이 카카오 내비 거리·시간 점수만 우선합니다.
+    // 전국 어디서든 같은 기준으로 쓰기 위해 생활권 강제 보정은 제거합니다.
     return 0;
+  };
+
+  const getRouteMoveCost = (distanceKm: number, durationMin: number) => {
+    const distance = Number(distanceKm);
+    const duration = Number(durationMin);
+    const safeDistance = Number.isFinite(distance) ? distance : 9999;
+    const safeDuration = Number.isFinite(duration) ? duration : 9999;
+
+    // 추천 적용: 다음 목적지까지의 실제 구간 거리·시간 비중을 강화합니다.
+    // 등급보다 네비 흐름이 먼저 잡히게 하고, 레드만 후순위 패널티로 남깁니다.
+    return safeDistance * 1.8 + safeDuration * 0.35;
   };
 
   const evaluateRouteScore = <T extends Customer & { coord: Coord }>(
@@ -1199,7 +1381,7 @@ export default function Home() {
       const localFlowPenalty = getLocalFlowPenalty(previousCustomer, customer);
       const gradePenalty = getGradeRoutePenalty(customer, step, route.length);
       const flagPenalty = getFlagRoutePenalty(customer, step, route.length);
-      const moveCost = result.distanceKm + result.durationMin / 10;
+      const moveCost = getRouteMoveCost(result.distanceKm, result.durationMin);
 
       totalDistance += result.distanceKm;
       totalDuration += result.durationMin;
@@ -1251,7 +1433,7 @@ export default function Home() {
       const areaSwitchPenalty = changedArea && step > 0 ? 2 : 0;
       const flowPenalty = getAreaFlowPenalty(currentArea, candidateArea);
       const localFlowPenalty = getLocalFlowPenalty(previousCustomer, customer);
-      const moveCost = result.distanceKm + result.durationMin / 10;
+      const moveCost = getRouteMoveCost(result.distanceKm, result.durationMin);
 
       // 미세 순서 보정은 등급보다 실제 주행 흐름을 우선함.
       score += moveCost + repeatAreaPenalty + areaSwitchPenalty + flowPenalty + localFlowPenalty;
@@ -1285,7 +1467,7 @@ export default function Home() {
       .sort((a, b) => {
         const da = readCachedDistance(currentCoord, a.coord);
         const db = readCachedDistance(currentCoord, b.coord);
-        return da.distanceKm + da.durationMin / 10 - (db.distanceKm + db.durationMin / 10);
+        return getRouteMoveCost(da.distanceKm, da.durationMin) - getRouteMoveCost(db.distanceKm, db.durationMin);
       })
       .slice(0, Math.min(7, remaining.length));
 
@@ -1317,7 +1499,7 @@ export default function Home() {
         const repeatAreaPenalty = returnedArea ? 210 + exitedCount * 90 : 0;
         const areaSwitchPenalty = changedArea && step > 0 ? 4 : 0;
         const flowPenalty = getAreaFlowPenalty(area, candidateArea);
-        const moveCost = result.distanceKm + result.durationMin / 10;
+        const moveCost = getRouteMoveCost(result.distanceKm, result.durationMin);
         const gradePenalty = getGradeRoutePenalty(candidate, step, total);
         const flagPenalty = getFlagRoutePenalty(candidate, step, total);
 
@@ -1405,7 +1587,7 @@ export default function Home() {
       const repeatAreaPenalty = returnedArea ? 210 + exitedCount * 90 : 0;
       const areaSwitchPenalty = changedArea && step > 0 ? 4 : 0;
       const flowPenalty = getAreaFlowPenalty(initialCurrentArea, candidateArea);
-      const moveCost = result.distanceKm + result.durationMin / 10;
+      const moveCost = getRouteMoveCost(result.distanceKm, result.durationMin);
 
       initialCost +=
         moveCost +
@@ -1475,7 +1657,7 @@ export default function Home() {
             step,
             targets.length,
           );
-          const moveCost = result.distanceKm + result.durationMin / 10;
+          const moveCost = getRouteMoveCost(result.distanceKm, result.durationMin);
 
           const nextCost =
             state.cost +
@@ -1601,10 +1783,9 @@ export default function Home() {
 
     const candidates = getCandidateRoutes(startCoord, targets);
 
-    // 8곳 이하 배차는 모든 순서를 직접 비교합니다.
-    // Kakao 내비 구간 시간/거리 캐시를 기준으로 비교하므로 목포뿐 아니라 광주·순천도 그대로 적용됩니다.
-    // 단, 레드 업체가 첫집으로 잡히는 경우만 제외합니다.
-    if (targets.length <= 8) {
+    // 전체 순열 비교는 계산량이 급격히 커져 브라우저가 멈출 수 있으므로
+    // 6곳 이하까지만 직접 비교합니다. 7곳 이상은 후보 경로/빔 탐색으로 처리합니다.
+    if (targets.length <= 6) {
       for (const permutation of getPermutations(targets)) {
         if (permutation.length > 1 && isRedRouteCustomer(permutation[0])) continue;
         candidates.push(permutation);
@@ -2036,16 +2217,35 @@ export default function Home() {
     return Math.round(total);
   };
 
-  const formatMin = (minutes: number | null) => {
-    if (minutes == null) return "미계산";
-    if (minutes <= 0) return "도착/진행중";
+  const formatMin = (
+    minutes: number | null | undefined,
+    startedAt?: string | null,
+  ) => {
+    if (minutes == null || Number.isNaN(Number(minutes))) return "미계산";
+    if (Number(minutes) <= 0) return "도착/진행중";
 
-    const hour = Math.floor(minutes / 60);
-    const min = minutes % 60;
+    const baseDate = (() => {
+      if (!startedAt) return new Date();
 
-    if (hour <= 0) return `${min}분 후`;
-    if (min === 0) return `${hour}시간 후`;
-    return `${hour}시간 ${min}분 후`;
+      const parsed = new Date(startedAt);
+      if (!Number.isNaN(parsed.getTime())) return parsed;
+
+      const timeMatch = String(startedAt).match(/(\d{1,2}):(\d{2})/);
+      if (timeMatch) {
+        const date = new Date();
+        date.setHours(Number(timeMatch[1]), Number(timeMatch[2]), 0, 0);
+        return date;
+      }
+
+      return new Date();
+    })();
+
+    baseDate.setMinutes(baseDate.getMinutes() + Number(minutes));
+
+    const hour = String(baseDate.getHours()).padStart(2, "0");
+    const minute = String(baseDate.getMinutes()).padStart(2, "0");
+
+    return `${hour}:${minute}`;
   };
 
   const updateSelectedCustomerField = (
@@ -2129,6 +2329,38 @@ ${selectedCustomers
     return `${month}.${day} ${hour}:${minute}`;
   };
 
+  const parseMobileDateTime = (value?: string | null) => {
+    if (!value) return null;
+    const time = new Date(value).getTime();
+    return Number.isFinite(time) ? time : null;
+  };
+
+  const formatClockTime = (timestamp: number) => {
+    const date = new Date(timestamp);
+    const hour = String(date.getHours()).padStart(2, "0");
+    const minute = String(date.getMinutes()).padStart(2, "0");
+    return `${hour}:${minute}`;
+  };
+
+  const getDispatchSlotStartedAt = (slot: SavedDispatchSlot) => {
+    return slot.startedAt ?? slot.items.find((item) => item.startedAt)?.startedAt ?? null;
+  };
+
+  const formatDispatchSlotArrivalTime = (
+    slot: SavedDispatchSlot,
+    item: SavedDispatchItem,
+  ) => {
+    if (item.unloadedAt || item.unloadDone) return "하차완료";
+
+    const startedAtValue = item.startedAt ?? getDispatchSlotStartedAt(slot);
+    const startedAt = parseMobileDateTime(startedAtValue);
+
+    if (item.etaMin == null) return startedAt == null ? "출발대기" : "도착 미계산";
+    if (startedAt == null) return `${formatMin(item.etaMin)} 도착`;
+
+    return `${formatClockTime(startedAt + item.etaMin * 60 * 1000)} 도착`;
+  };
+
   const makeDispatchSlotCopyText = (slotNumber: number, items: SavedDispatchItem[], driverName: string) => {
     const totalCount = items.reduce((sum, item) => sum + (item.count ?? 0), 0);
     const nameText = driverName.trim() || "배차자미입력";
@@ -2142,7 +2374,7 @@ ${selectedCustomers
       .join("\n")}`;
   };
 
-  const completeDispatch = () => {
+  const completeDispatch = async () => {
     if (selectedCustomers.length === 0) {
       alert("완료할 선택 업체가 없습니다.");
       return;
@@ -2152,6 +2384,7 @@ ${selectedCustomers
     grouped.set(selectedDispatchNumber, selectedCustomers);
 
     const nowText = getCurrentSlotTimeText();
+    const slotsToPublish: { slot: SavedDispatchSlot; driverName: string }[] = [];
 
     setDispatchSlots((prev) => {
       const nextSlots = [...prev];
@@ -2171,9 +2404,22 @@ ${selectedCustomers
           distanceKm: customer.distanceKm ?? null,
           durationMin: customer.durationMin ?? null,
           etaMin: getEtaMin(selectedCustomers.findIndex((item) => item.id === customer.id)),
+          startedAt: null,
+          unloadedAt: undefined,
+          unloadedBy: undefined,
+          unloadDone: false,
+          released: false,
         }));
 
-        const mergedItems = [...existingItems, ...newItems];
+        const mergedItems = [...existingItems, ...newItems].map((item, index) => ({
+          ...item,
+          order: index + 1,
+          startedAt: item.startedAt ?? null,
+          unloadedAt: undefined,
+          unloadedBy: undefined,
+          unloadDone: false,
+          released: false,
+        }));
         const driverName = existingSlot?.driverName ?? dispatchDriverNames[slotNumber] ?? "";
         const totalDistance = Math.round(
           mergedItems.reduce((sum, item) => sum + (item.distanceKm ?? 0), 0) * 10,
@@ -2189,7 +2435,14 @@ ${selectedCustomers
           totalOrderCount,
           copyText: copyTextForSlot,
           driverName,
+          startedAt: null,
+          mobileConfirmedAt: undefined,
+          mobileConfirmedBy: undefined,
+          mobileReleasedAt: undefined,
+          mobileReleasedBy: undefined,
         };
+
+        slotsToPublish.push({ slot: savedSlot, driverName });
 
         const existingIndex = nextSlots.findIndex((slot) => slot.slot === slotNumber);
         if (existingIndex >= 0) nextSlots[existingIndex] = savedSlot;
@@ -2199,10 +2452,121 @@ ${selectedCustomers
       return nextSlots.sort((a, b) => a.slot - b.slot);
     });
 
+    try {
+      await Promise.all(
+        slotsToPublish.map(({ slot, driverName }) =>
+          publishDispatchSlotToMobile(slot, driverName),
+        ),
+      );
+    } catch {
+      setMessage(`선택 업체 배차${selectedDispatchNumber} 지정 완료 / 모바일 전송 실패`);
+    }
+
+    const dispatchedIds = selectedCustomers.map((customer) => customer.id);
+
+    setPendingOrderIds((prev) =>
+      prev.filter((pendingId) => !dispatchedIds.includes(pendingId)),
+    );
+    setPendingOrderTimes((prev) => {
+      const next = { ...prev };
+      dispatchedIds.forEach((id) => {
+        delete next[id];
+      });
+      return next;
+    });
+    setPendingOrderSources((prev) => {
+      const next = { ...prev };
+      dispatchedIds.forEach((id) => {
+        delete next[id];
+      });
+      return next;
+    });
+    setPendingOrderSourceNames((prev) => {
+      const next = { ...prev };
+      dispatchedIds.forEach((id) => {
+        delete next[id];
+      });
+      return next;
+    });
+    setPendingOrderRawTexts((prev) => {
+      const next = { ...prev };
+      dispatchedIds.forEach((id) => {
+        delete next[id];
+      });
+      return next;
+    });
+    if (editingPendingOrderId != null && dispatchedIds.includes(editingPendingOrderId)) {
+      setEditingPendingOrderId(null);
+      setEditingPendingOrderText("");
+    }
+
     setMessage(`선택 업체 배차${selectedDispatchNumber} 지정 완료`);
   };
 
-  const completeDispatchSlot = (slotNumber: number) => {
+  const publishDispatchSlotToMobile = async (slot: SavedDispatchSlot, driverName: string) => {
+    const payload: MobileDispatchSlotPayload = {
+      slot: slot.slot,
+      createdAt: slot.createdAt,
+      driverName,
+      items: [...slot.items].sort((a, b) => a.order - b.order),
+      totalDistance: slot.totalDistance,
+      totalOrderCount: slot.totalOrderCount,
+      copyText: makeDispatchSlotCopyText(slot.slot, slot.items, driverName),
+      startedAt: slot.startedAt ?? slot.items.find((item) => item.startedAt)?.startedAt ?? null,
+      mobileConfirmedAt: slot.mobileConfirmedAt,
+      mobileConfirmedBy: slot.mobileConfirmedBy,
+      mobileReleasedAt: slot.mobileReleasedAt,
+      mobileReleasedBy: slot.mobileReleasedBy,
+    };
+
+    await fetch("/api/mobile-dispatch", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action: "upsertSlot", slot: payload }),
+    });
+  };
+
+  const applyMobileConfirmedSlot = (confirmedSlot: MobileDispatchSlotPayload) => {
+    setDispatchSlots((prev) =>
+      prev.map((slot) => {
+        if (slot.slot !== confirmedSlot.slot) return slot;
+
+        const confirmedItems = Array.isArray(confirmedSlot.items)
+          ? normalizeMobileSlotItems(
+              confirmedSlot.items,
+              slot.items,
+              confirmedSlot.driverName || slot.driverName || "",
+            )
+          : slot.items;
+        const startedAt =
+          confirmedSlot.startedAt ??
+          confirmedItems.find((item) => item.startedAt)?.startedAt ??
+          slot.startedAt ??
+          null;
+
+        return {
+          ...slot,
+          items: confirmedItems,
+          totalDistance:
+            Math.round(confirmedItems.reduce((sum, item) => sum + (item.distanceKm ?? 0), 0) * 10) / 10,
+          totalOrderCount: confirmedItems.reduce((sum, item) => sum + (item.count ?? 0), 0),
+          copyText: makeDispatchSlotCopyText(
+            slot.slot,
+            confirmedItems,
+            confirmedSlot.driverName || slot.driverName || "",
+          ),
+          driverName: confirmedSlot.driverName || slot.driverName,
+          startedAt,
+          mobileConfirmedAt: confirmedSlot.mobileConfirmedAt || slot.mobileConfirmedAt,
+          mobileConfirmedBy: confirmedSlot.mobileConfirmedBy || slot.mobileConfirmedBy,
+          mobileReleasedAt: confirmedSlot.mobileReleasedAt || slot.mobileReleasedAt,
+          mobileReleasedBy: confirmedSlot.mobileReleasedBy || slot.mobileReleasedBy,
+        };
+      }),
+    );
+  };
+
+  const completeDispatchSlot = async (slotNumber: number) => {
     const slot = dispatchSlots.find((item) => item.slot === slotNumber);
     if (!slot || slot.items.length === 0) {
       alert(`배차${slotNumber}에 지정된 업체가 없습니다.`);
@@ -2216,23 +2580,130 @@ ${selectedCustomers
       return;
     }
 
-    const nextCopyText = makeDispatchSlotCopyText(slotNumber, slot.items, driverName);
+    const allUnloaded = slot.items.length > 0 && slot.items.every((item) => item.unloadedAt || item.unloadDone);
+
+    if (slot.mobileConfirmedAt && allUnloaded) {
+      const completedAt = new Date().toISOString();
+      const completedSlot: SavedDispatchSlot = {
+        ...slot,
+        driverName,
+        items: slot.items.map((item) => ({
+          ...item,
+          released: true,
+        })),
+        mobileReleasedAt: slot.mobileReleasedAt ?? completedAt,
+        mobileReleasedBy: slot.mobileReleasedBy ?? driverName,
+      };
+
+      setDispatchSlots((prev) =>
+        prev.map((item) => (item.slot === slotNumber ? completedSlot : item)),
+      );
+
+      try {
+        await fetch("/api/mobile-dispatch", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            action: "completeDispatch",
+            driverName,
+            items: completedSlot.items.map((item) => ({
+              ...item,
+              slot: slotNumber,
+              dispatchSlot: slotNumber,
+              released: true,
+            })),
+          }),
+        });
+      } catch {
+        // 모바일 API 실패 시 PC 화면은 완료 상태로 유지
+      }
+
+      setDispatchCopyText(completedSlot.copyText);
+      setMessage(`배차${slotNumber} 배차완료 처리 완료`);
+      return;
+    }
+
+    const resetItems = slot.items.map((item, index) => ({
+      ...item,
+      order: index + 1,
+      startedAt: null,
+      unloadedAt: undefined,
+      unloadedBy: undefined,
+      unloadDone: false,
+      released: false,
+    }));
+    const nextCopyText = makeDispatchSlotCopyText(slotNumber, resetItems, driverName);
+    const nextSlot: SavedDispatchSlot = {
+      ...slot,
+      driverName,
+      startedAt: null,
+      items: resetItems,
+      totalOrderCount: resetItems.reduce((sum, savedItem) => sum + (savedItem.count ?? 0), 0),
+      copyText: nextCopyText,
+      mobileConfirmedAt: undefined,
+      mobileConfirmedBy: undefined,
+      mobileReleasedAt: undefined,
+      mobileReleasedBy: undefined,
+    };
 
     setDispatchSlots((prev) =>
-      prev.map((item) =>
-        item.slot === slotNumber
-          ? {
-              ...item,
-              driverName,
-              totalOrderCount: item.items.reduce((sum, savedItem) => sum + (savedItem.count ?? 0), 0),
-              copyText: nextCopyText,
-            }
-          : item,
-      ),
+      prev.map((item) => (item.slot === slotNumber ? nextSlot : item)),
     );
 
-    setDispatchCopyText(nextCopyText);
-    setMessage(`배차${slotNumber} 카톡 붙여넣기 입력 완료`);
+    try {
+      await publishDispatchSlotToMobile(nextSlot, driverName);
+      setDispatchCopyText(nextCopyText);
+      setMessage(`배차${slotNumber} 모바일 전송 완료 / 기사 확인 대기`);
+    } catch {
+      setDispatchCopyText(nextCopyText);
+      setMessage(`배차${slotNumber} 저장 완료 / 모바일 전송 실패`);
+    }
+  };
+
+  const releaseDispatchSlotToMobile = async (slotNumber: number) => {
+    const slot = dispatchSlots.find((item) => item.slot === slotNumber);
+    if (!slot || !slot.mobileConfirmedAt) return;
+
+    try {
+      const res = await fetch("/api/mobile-dispatch", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "releaseSlot", slot }),
+      });
+
+      const data = await res.json();
+      if (!res.ok || !data.slot) return;
+
+      setDispatchSlots((prev) =>
+        prev.map((item) =>
+          item.slot === slotNumber
+            ? {
+                ...item,
+                items: Array.isArray(data.slot.items)
+                  ? normalizeMobileSlotItems(
+                      data.slot.items,
+                      item.items,
+                      data.slot.driverName || item.driverName || "",
+                    )
+                  : item.items,
+                startedAt: data.slot.startedAt ?? item.startedAt,
+                mobileReleasedAt: data.slot.mobileReleasedAt,
+                mobileReleasedBy: data.slot.mobileReleasedBy,
+              }
+            : item,
+        ),
+      );
+      setMessage(`배차${slotNumber} 모바일 배차창 이동 완료`);
+    } catch {
+      setMessage(`배차${slotNumber} 모바일 배차창 이동 실패`);
+    }
+  };
+
+  const openDispatchSlotFromPc = async (slot: SavedDispatchSlot) => {
+    if (slot.mobileConfirmedAt && !slot.mobileReleasedAt) {
+      await releaseDispatchSlotToMobile(slot.slot);
+    }
+    applyDispatchSlotToSelectedList(slot);
   };
 
   const deleteDispatchSlot = (slotNumber: number) => {
@@ -2285,7 +2756,7 @@ ${selectedCustomers
           distanceKm: savedItem.distanceKm,
           durationMin: savedItem.durationMin,
           coordWarning: false,
-          startedAt: null,
+          startedAt: savedItem.startedAt ?? null,
           unloadingMin: DEFAULT_UNLOADING_MIN,
         };
       }),
@@ -2488,7 +2959,7 @@ ${selectedCustomers
 
   const isCompletedDispatchSlot = (slotNumber: number) => {
     const slot = dispatchSlots.find((item) => item.slot === slotNumber);
-    return Boolean(slot?.driverName?.trim());
+    return Boolean(slot?.mobileConfirmedAt);
   };
 
   const renderCompletedDispatchBoxes = (slotNumbers: number[]) => {
@@ -2506,21 +2977,24 @@ ${selectedCustomers
                 type="button"
                 onClick={() => {
                   if (slot) {
-                    applyDispatchSlotToSelectedList(slot);
+                    openDispatchSlotFromPc(slot);
                     setOpenedCompletedSlotNumber(slotNumber);
                   }
                 }}
                 style={{
                   ...completedDispatchBox,
+                  ...(completed ? completedDispatchBoxConfirmed : {}),
                   cursor: slot ? "pointer" : "default",
                   opacity: slot ? 1 : 0.75,
                 }}
               >
                 <div style={completedDispatchHeader}>
                   <strong>배차{slotNumber}</strong>
-                  <span>{completed ? slot?.driverName : "대기"}</span>
+                  <span>{completed ? slot?.driverName : slot?.driverName ? "확인대기" : "대기"}</span>
                 </div>
-                <p style={completedDispatchEmpty}>{completed ? "상세보기" : "완료 전"}</p>
+                <p style={completed ? completedDispatchConfirmedText : completedDispatchEmpty}>
+                  {completed ? "모바일 확인완료" : slot?.driverName ? "모바일 확인 전" : "완료 전"}
+                </p>
               </button>
             );
           })}
@@ -3438,10 +3912,13 @@ ${selectedCustomers
                       key={slotNumber}
                       style={{
                         ...dispatchSlotBox,
+                        ...(slot?.mobileConfirmedAt && !slot.mobileReleasedAt
+                          ? { background: "#fee2e2", borderColor: "#fecaca" }
+                          : {}),
                         cursor: slot ? "pointer" : "default",
                       }}
                       onClick={() => {
-                        if (slot) applyDispatchSlotToSelectedList(slot);
+                        if (slot) openDispatchSlotFromPc(slot);
                       }}
                     >
                       <div style={dispatchSlotHeader}>
@@ -3468,13 +3945,28 @@ ${selectedCustomers
                       ) : (
                         <>
                           <div style={dispatchSlotList}>
-                            {slot.items.map((item) => (
-                              <div key={`${slot.slot}-${item.id}`} style={dispatchSlotItem}>
-                                {item.order}. {item.area} {item.name}
-                                {` ${item.count ?? 0}장`}
-                                {item.forklift ? " 지게발" : ""}
-                              </div>
-                            ))}
+                            {slot.items.map((item) => {
+                              const unloaded = Boolean(item.unloadedAt || item.unloadDone);
+                              const arrivalText = formatDispatchSlotArrivalTime(slot, item);
+                              return (
+                                <div key={`${slot.slot}-${item.id}`} style={dispatchSlotItem}>
+                                  <span>
+                                    {item.order}. {item.area} {item.name}
+                                    <span
+                                      style={{
+                                        ...dispatchSlotDoneBadge,
+                                        ...(unloaded ? dispatchSlotDoneBadgeActive : {}),
+                                      }}
+                                    >
+                                      완료
+                                    </span>
+                                    {` ${item.count ?? 0}장`}
+                                    {item.forklift ? " 지게발" : ""}
+                                    {` / ${arrivalText}`}
+                                  </span>
+                                </div>
+                              );
+                            })}
                           </div>
 
                           <input
@@ -3498,7 +3990,7 @@ ${selectedCustomers
                             }}
                             style={dispatchSlotCompleteButton}
                           >
-                            완료
+                            {slot.mobileReleasedAt ? "완료됨" : "완료"}
                           </button>
                         </>
                       )}
@@ -3593,7 +4085,7 @@ ${selectedCustomers
               <div style={etaText}>
                 상태:{" "}
                 {customer.startedAt ? `${customer.startedAt} 출발` : "대기중"} /
-                예상도착: {formatMin(getEtaMin(index))}
+                예상도착: {formatMin(getEtaMin(index), selectedCustomers[0]?.startedAt)}
               </div>
 
             </div>
@@ -3752,20 +4244,31 @@ ${selectedCustomers
                 <div style={completedDetailList}>
                   {openedCompletedSlot.items
                     .sort((a, b) => a.order - b.order)
-                    .map((item) => (
-                      <div key={`detail-${openedCompletedSlot.slot}-${item.id}`} style={selectedCard}>
-                        <div style={{ fontSize: 13, fontWeight: 900, color: "#111827" }}>
-                          {item.order}. {item.area} {item.name}
+                    .map((item) => {
+                      const unloaded = Boolean(item.unloadedAt || item.unloadDone);
+                      return (
+                        <div key={`detail-${openedCompletedSlot.slot}-${item.id}`} style={selectedCard}>
+                          <div style={{ fontSize: 13, fontWeight: 900, color: "#111827", display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+                            <span>{item.order}. {item.area} {item.name}</span>
+                            <span
+                              style={{
+                                ...dispatchSlotDoneBadge,
+                                ...(unloaded ? dispatchSlotDoneBadgeActive : {}),
+                              }}
+                            >
+                              {unloaded ? "완료" : "배송완료"}
+                            </span>
+                          </div>
+                          <div style={distanceText}>
+                            {item.distanceKm == null ? "미계산" : `${item.distanceKm}km`}
+                            {item.durationMin == null ? "" : ` / 구간 ${item.durationMin}분`}
+                          </div>
+                          <div style={etaText}>
+                            예상도착: {formatDispatchSlotArrivalTime(openedCompletedSlot, item)}
+                          </div>
                         </div>
-                        <div style={distanceText}>
-                          {item.distanceKm == null ? "미계산" : `${item.distanceKm}km`}
-                          {item.durationMin == null ? "" : ` / 구간 ${item.durationMin}분`}
-                        </div>
-                        <div style={etaText}>
-                          예상도착: {formatMin(item.etaMin)}
-                        </div>
-                      </div>
-                    ))}
+                      );
+                    })}
                 </div>
               </aside>
             </>
@@ -4315,6 +4818,22 @@ const dispatchSlotItem: React.CSSProperties = {
   lineHeight: 1.35,
 };
 
+const dispatchSlotDoneBadge: React.CSSProperties = {
+  display: "inline-block",
+  marginLeft: 5,
+  padding: "1px 5px",
+  borderRadius: 999,
+  border: "1px solid #cbd5e1",
+  color: "#94a3b8",
+  fontSize: 9,
+  fontWeight: 900,
+};
+
+const dispatchSlotDoneBadgeActive: React.CSSProperties = {
+  border: "1px solid #ef4444",
+  background: "#fee2e2",
+  color: "#dc2626",
+};
 
 const dispatchDriverInput: React.CSSProperties = {
   width: "25%",
@@ -4740,6 +5259,11 @@ const completedDispatchBox: React.CSSProperties = {
   textAlign: "left",
 };
 
+const completedDispatchBoxConfirmed: React.CSSProperties = {
+  border: "2px solid #ef4444",
+  background: "#fee2e2",
+};
+
 const completedDispatchHeader: React.CSSProperties = {
   display: "flex",
   justifyContent: "space-between",
@@ -4748,6 +5272,12 @@ const completedDispatchHeader: React.CSSProperties = {
   fontSize: 11,
   color: "#0f172a",
   marginBottom: 6,
+};
+
+const completedDispatchConfirmedText: React.CSSProperties = {
+  margin: 0,
+  color: "#b91c1c",
+  fontWeight: 900,
 };
 
 const completedDispatchEmpty: React.CSSProperties = {
